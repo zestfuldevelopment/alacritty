@@ -25,4 +25,4 @@ toml_edit = "0.24.0"
 # force-push silently changes what this builds. See alacritty_terminal's
 # FORK_NOTES.md.
 [patch.crates-io]
-vte = { path = "../vte-src" }
+vte = { git = "https://github.com/zestfuldevelopment/vte", rev = "52addbf77223f25d6c13776ffc4284c611457380" }
