@@ -266,6 +266,16 @@ impl TermDamageState {
 }
 
 pub struct Term<T> {
+    /// APC payloads received since the last drain, oldest first.
+    ///
+    /// **zestful addition to upstream alacritty_terminal.** The kitty graphics
+    /// protocol arrives over APC, which upstream `vte` discards outright; the
+    /// zestful `vte` fork delivers it to `Handler::apc_dispatch`, and this is
+    /// where it lands. It is a queue rather than a callback because `Term` is
+    /// filled on alacritty's event-loop thread behind a `FairMutex` and read
+    /// from another thread — see `take_apc_payloads`.
+    apc_payloads: Vec<Vec<u8>>,
+
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
 
@@ -437,6 +447,7 @@ impl<T> Term<T> {
             cursor_style: Default::default(),
             colors: color::Colors::default(),
             title_stack: Default::default(),
+            apc_payloads: Vec::new(),
             is_focused: Default::default(),
             selection: Default::default(),
             title: Default::default(),
@@ -1056,7 +1067,36 @@ impl<T> Dimensions for Term<T> {
     }
 }
 
+impl<T> Term<T> {
+    /// Take every APC payload received since the last call, oldest first.
+    ///
+    /// **zestful addition to upstream alacritty_terminal.** Draining rather
+    /// than borrowing keeps the `FairMutex` held for the move alone: the caller
+    /// takes the lock, swaps the queue out, and releases it before decoding.
+    #[inline]
+    pub fn take_apc_payloads(&mut self) -> Vec<Vec<u8>> {
+        core::mem::take(&mut self.apc_payloads)
+    }
+
+    /// Whether any APC payload is waiting, without taking the queue.
+    #[inline]
+    pub fn has_apc_payloads(&self) -> bool {
+        !self.apc_payloads.is_empty()
+    }
+}
+
 impl<T: EventListener> Handler for Term<T> {
+    /// **zestful addition.** Queue an APC payload for the embedder to drain.
+    ///
+    /// Deliberately does no interpretation: `Term` does not know what the
+    /// kitty graphics protocol is, and the anchoring rules need the cursor
+    /// position at the moment the payload arrived, which the embedder reads
+    /// from this same locked `Term`.
+    #[inline]
+    fn apc_dispatch(&mut self, bytes: &[u8]) {
+        self.apc_payloads.push(bytes.to_vec());
+    }
+
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
@@ -3299,4 +3339,56 @@ mod tests {
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
     }
+
+    /// **zestful.** A kitty graphics command must survive the whole path:
+    /// `Processor::advance` -> the forked vte parser -> `Handler::apc_dispatch`
+    /// -> `Term`'s queue. This is the seam the graphics engine drains.
+    #[test]
+    fn apc_payload_reaches_term_through_the_parser() {
+        let size = TermSize::new(10, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        assert!(!term.has_apc_payloads());
+        parser.advance(&mut term, b"\x1b_Gf=100,a=T,i=1;iVBORw0KGgo=\x1b\\");
+
+        assert!(term.has_apc_payloads());
+        assert_eq!(term.take_apc_payloads(), vec![b"Gf=100,a=T,i=1;iVBORw0KGgo=".to_vec()]);
+        assert!(!term.has_apc_payloads(), "draining must empty the queue");
+    }
+
+    /// Text around a graphics command must still land on the grid: the APC is
+    /// consumed by the parser, not printed, and does not disturb the cursor.
+    #[test]
+    fn text_around_an_apc_is_unaffected() {
+        let size = TermSize::new(10, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"AB\x1b_Gi=1;DATA\x1b\\CD");
+
+        assert_eq!(term.take_apc_payloads(), vec![b"Gi=1;DATA".to_vec()]);
+        let row: String = (0..4).map(|c| term.grid[Line(0)][Column(c)].c).collect();
+        assert_eq!(row, "ABCD");
+    }
+
+    /// Chunked transmission (`m=1`) arrives as several payloads in order — the
+    /// assembler upstack needs them ordered and complete.
+    #[test]
+    fn chunked_apc_payloads_queue_in_order() {
+        let size = TermSize::new(10, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b_Gi=1,m=1;AAAA\x1b\\");
+        parser.advance(&mut term, b"\x1b_Gm=1;BBBB\x1b\\");
+        parser.advance(&mut term, b"\x1b_Gm=0;CCCC\x1b\\");
+
+        assert_eq!(term.take_apc_payloads(), vec![
+            b"Gi=1,m=1;AAAA".to_vec(),
+            b"Gm=1;BBBB".to_vec(),
+            b"Gm=0;CCCC".to_vec(),
+        ]);
+    }
+
 }

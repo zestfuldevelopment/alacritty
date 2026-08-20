@@ -19,3 +19,10 @@ incremental = false
 [workspace.dependencies]
 toml = "0.9.11"
 toml_edit = "0.24.0"
+
+# zestful: alacritty_terminal's Handler::apc_dispatch requires the zestful vte
+# fork, which adds it. Pinned by REV, never by branch — a branch pin means a
+# force-push silently changes what this builds. See alacritty_terminal's
+# FORK_NOTES.md.
+[patch.crates-io]
+vte = { path = "../vte-src" }
