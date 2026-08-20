@@ -34,19 +34,16 @@ zestful `vte` fork's `Handler::apc_dispatch` is defaulted, so this compiles
 against it untouched. That is true for *compiling* and false for *receiving*.
 
 The alternative was to drive `Processor::advance` against our own `Handler`
-wrapper and never fork this crate. **That is not available for real panes.**
-`zterm` owns the `advance` call site in only one place — `GridCore`, the
-hermetic conformance half, which has no PTY. Real panes go through
-`EventLoop::spawn`, and the call site is inside this crate
+wrapper and never fork this crate. **That is not available to an embedder using
+this crate's event loop.**
+An embedder owns the `advance` call site only where it drives a `Processor`
+itself; a terminal that uses this crate's `EventLoop` does not. Real panes go
+through `EventLoop::spawn`, and the call site is inside this crate
 (`alacritty_terminal/src/event_loop.rs:154`,
 `state.parser.advance(&mut **terminal, ...)`) against a `Term` behind a
 `FairMutex`. Wrapping would mean replacing that 486-line event loop — mio
 polling, the PTY write queue, resize, shutdown, and `MAX_LOCKED_READ` lock
 fairness — to save a 5-line delta. Rejected.
-
-Full reasoning and measurements:
-
-> `zestful-internal/docs/terminal/plans/2026-08-20-kitty-graphics-protocol.md`
 
 ## Rebase costs
 
@@ -60,7 +57,8 @@ Full reasoning and measurements:
   is deleted, so a rebase conflicts only if upstream edits `Term`'s field list
   or its `Handler` impl block near these lines.
 - **It depends on the `vte` fork.** The `[patch.crates-io]` entry must be
-  re-pointed whenever the `vte` fork's rev moves.
+  re-pointed whenever the `vte` fork's rev moves. That fork's `FORK_NOTES.md`
+  documents its own delta and deliberate divergences.
 - All **181** upstream tests pass unmodified (135 + 45 + 1).
 
 ## Tests
