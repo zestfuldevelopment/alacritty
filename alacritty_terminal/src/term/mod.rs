@@ -324,8 +324,38 @@ pub struct ApcAnchor {
     pub display_offset: usize,
 }
 
+/// A thing the graphics layer has to know happened, in stream order.
+///
+/// **One queue, not several.** APC payloads and screen erasures must share an
+/// ordering or the consumer cannot answer the only question it has: was this
+/// image placed before the erase, or after it? `<image> ESC[2J <image>` arrives
+/// in a single `read()`, so two parallel queues drained together would give
+/// "two images, one clear" with no way to tell which image survived. That is
+/// the same shape as the anchor defect — information that exists only at one
+/// moment, discarded before the consumer runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphicsEvent {
+    /// An APC payload, with where the cursor was when it arrived.
+    Apc { anchor: ApcAnchor, payload: Vec<u8> },
+
+    /// `ED` — erase in display.
+    ///
+    /// The **mode is carried, never collapsed**. The protocol's rule is that
+    /// `ED 2` clears graphics while `ED 0` and `ED 1` do not, so a consumer
+    /// given only "the screen was erased" cannot implement it, and a test of
+    /// that rule could not fail. `ClearMode::All` must stay distinguishable
+    /// from `Below`, `Above` and `Saved` at the drain.
+    ClearScreen { mode: ansi::ClearMode },
+
+    /// `RIS` — full reset.
+    Reset,
+
+    /// The terminal was resized, in cells.
+    Resize { columns: usize, screen_lines: usize },
+}
+
 pub struct Term<T> {
-    /// APC payloads received since the last drain, oldest first.
+    /// Graphics-relevant events since the last drain, oldest first.
     ///
     /// **zestful addition to upstream alacritty_terminal.** The kitty graphics
     /// protocol arrives over APC, which upstream `vte` discards outright; the
@@ -333,7 +363,7 @@ pub struct Term<T> {
     /// where it lands. It is a queue rather than a callback because `Term` is
     /// filled on alacritty's event-loop thread behind a `FairMutex` and read
     /// from another thread — see `take_apc_payloads`.
-    apc_payloads: Vec<(ApcAnchor, Vec<u8>)>,
+    graphics_events: Vec<GraphicsEvent>,
 
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
@@ -506,7 +536,7 @@ impl<T> Term<T> {
             cursor_style: Default::default(),
             colors: color::Colors::default(),
             title_stack: Default::default(),
-            apc_payloads: Vec::new(),
+            graphics_events: Vec::new(),
             is_focused: Default::default(),
             selection: Default::default(),
             title: Default::default(),
@@ -733,6 +763,12 @@ impl<T> Term<T> {
             debug!("Term::resize dimensions unchanged");
             return;
         }
+
+        // zestful: placements are anchored to cells, so a resize re-derives
+        // every image's pixel rect. Emitted after the early return, so a
+        // no-op resize does not generate an event.
+        self.graphics_events
+            .push(GraphicsEvent::Resize { columns: num_cols, screen_lines: num_lines });
 
         debug!("New num_cols is {num_cols} and num_lines is {num_lines}");
 
@@ -1127,22 +1163,22 @@ impl<T> Dimensions for Term<T> {
 }
 
 impl<T> Term<T> {
-    /// Take every APC payload received since the last call, oldest first.
+    /// Take every graphics event since the last call, in stream order.
     ///
-    /// Each payload is paired with the [`ApcAnchor`] captured when it arrived.
+    /// APC payloads carry the [`ApcAnchor`] captured when they arrived.
     ///
     /// **zestful addition to upstream alacritty_terminal.** Draining rather
     /// than borrowing keeps the `FairMutex` held for the move alone: the caller
     /// takes the lock, swaps the queue out, and releases it before decoding.
     #[inline]
-    pub fn take_apc_payloads(&mut self) -> Vec<(ApcAnchor, Vec<u8>)> {
-        core::mem::take(&mut self.apc_payloads)
+    pub fn take_graphics_events(&mut self) -> Vec<GraphicsEvent> {
+        core::mem::take(&mut self.graphics_events)
     }
 
-    /// Whether any APC payload is waiting, without taking the queue.
+    /// Whether any graphics event is waiting, without taking the queue.
     #[inline]
-    pub fn has_apc_payloads(&self) -> bool {
-        !self.apc_payloads.is_empty()
+    pub fn has_graphics_events(&self) -> bool {
+        !self.graphics_events.is_empty()
     }
 }
 
@@ -1162,7 +1198,7 @@ impl<T: EventListener> Handler for Term<T> {
                 + i64::from(self.grid.cursor.point.line.0),
             display_offset: self.grid.display_offset(),
         };
-        self.apc_payloads.push((anchor, bytes.to_vec()));
+        self.graphics_events.push(GraphicsEvent::Apc { anchor, payload: bytes.to_vec() });
     }
 
     /// A character to be displayed.
@@ -1857,6 +1893,11 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn clear_screen(&mut self, mode: ansi::ClearMode) {
         trace!("Clearing screen: {mode:?}");
+        // zestful: the MODE is carried, never collapsed to "erased". The
+        // graphics protocol clears images on ED 2 but not on ED 0 or ED 1, so a
+        // consumer told only that the screen was erased cannot implement that
+        // rule -- and a test of it could not fail.
+        self.graphics_events.push(GraphicsEvent::ClearScreen { mode });
         let bg = self.grid.cursor.template.bg;
 
         let screen_lines = self.screen_lines();
@@ -1941,6 +1982,9 @@ impl<T: EventListener> Handler for Term<T> {
     /// Reset all important fields in the term struct.
     #[inline]
     fn reset_state(&mut self) {
+        // zestful: RIS discards every image. Pushed BEFORE the reset so it is
+        // ordered against any APC earlier in the same read.
+        self.graphics_events.push(GraphicsEvent::Reset);
         if self.mode.contains(TermMode::ALT_SCREEN) {
             mem::swap(&mut self.grid, &mut self.inactive_grid);
         }
@@ -3408,6 +3452,27 @@ mod tests {
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
     }
 
+    /// Pull just the APC payloads out of a drained event stream.
+    fn apc_only(events: &[GraphicsEvent]) -> Vec<Vec<u8>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                GraphicsEvent::Apc { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn apc_anchors(events: &[GraphicsEvent]) -> Vec<ApcAnchor> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                GraphicsEvent::Apc { anchor, .. } => Some(*anchor),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// **zestful.** A kitty graphics command must survive the whole path:
     /// `Processor::advance` -> the forked vte parser -> `Handler::apc_dispatch`
     /// -> `Term`'s queue. This is the seam the graphics engine drains.
@@ -3417,14 +3482,13 @@ mod tests {
         let mut term = Term::new(Config::default(), &size, VoidListener);
         let mut parser: ansi::Processor = ansi::Processor::new();
 
-        assert!(!term.has_apc_payloads());
+        assert!(!term.has_graphics_events());
         parser.advance(&mut term, b"\x1b_Gf=100,a=T,i=1;iVBORw0KGgo=\x1b\\");
 
-        assert!(term.has_apc_payloads());
-        let drained = term.take_apc_payloads();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].1, b"Gf=100,a=T,i=1;iVBORw0KGgo=".to_vec());
-        assert!(!term.has_apc_payloads(), "draining must empty the queue");
+        assert!(term.has_graphics_events());
+        let drained = term.take_graphics_events();
+        assert_eq!(apc_only(&drained), vec![b"Gf=100,a=T,i=1;iVBORw0KGgo=".to_vec()]);
+        assert!(!term.has_graphics_events(), "draining must empty the queue");
     }
 
     /// Text around a graphics command must still land on the grid: the APC is
@@ -3437,7 +3501,7 @@ mod tests {
 
         parser.advance(&mut term, b"AB\x1b_Gi=1;DATA\x1b\\CD");
 
-        assert_eq!(term.take_apc_payloads()[0].1, b"Gi=1;DATA".to_vec());
+        assert_eq!(apc_only(&term.take_graphics_events())[0], b"Gi=1;DATA".to_vec());
         let row: String = (0..4).map(|c| term.grid[Line(0)][Column(c)].c).collect();
         assert_eq!(row, "ABCD");
     }
@@ -3454,7 +3518,7 @@ mod tests {
         parser.advance(&mut term, b"\x1b_Gm=1;BBBB\x1b\\");
         parser.advance(&mut term, b"\x1b_Gm=0;CCCC\x1b\\");
 
-        let payloads: Vec<Vec<u8>> = term.take_apc_payloads().into_iter().map(|(_, b)| b).collect();
+        let payloads = apc_only(&term.take_graphics_events());
         assert_eq!(
             payloads,
             vec![b"Gi=1,m=1;AAAA".to_vec(), b"Gm=1;BBBB".to_vec(), b"Gm=0;CCCC".to_vec(),]
@@ -3473,10 +3537,10 @@ mod tests {
 
         parser.advance(&mut term, b"AB\x1b_Ga=T,i=1;DATA\x1b\\CDEFGH");
 
-        let drained = term.take_apc_payloads();
+        let drained = apc_anchors(&term.take_graphics_events());
         assert_eq!(drained.len(), 1);
         assert_eq!(
-            drained[0].0.point,
+            drained[0].point,
             Point::new(Line(0), Column(2)),
             "anchored where the image was"
         );
@@ -3496,10 +3560,10 @@ mod tests {
 
         parser.advance(&mut term, b"A\x1b_Gi=1;ONE\x1b\\BB\x1b_Gi=2;TWO\x1b\\CCC");
 
-        let drained = term.take_apc_payloads();
-        assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].0.point.column, Column(1));
-        assert_eq!(drained[1].0.point.column, Column(3));
+        let anchors = apc_anchors(&term.take_graphics_events());
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0].point.column, Column(1));
+        assert_eq!(anchors[1].point.column, Column(3));
     }
 
     /// Newlines after an image move it up a line; the captured line is the one
@@ -3512,8 +3576,8 @@ mod tests {
 
         parser.advance(&mut term, b"\r\n\r\n\x1b_Gi=1;IMG\x1b\\\r\nafter");
 
-        let drained = term.take_apc_payloads();
-        assert_eq!(drained[0].0.point.line, Line(2), "arrived on the third line");
+        let anchors = apc_anchors(&term.take_graphics_events());
+        assert_eq!(anchors[0].point.line, Line(2), "arrived on the third line");
     }
 
     /// The absolute anchor survives scrolling that happens after the image
@@ -3527,7 +3591,7 @@ mod tests {
 
         parser.advance(&mut term, b"one\r\ntwo\r\n\x1b_Gi=1;IMG\x1b\\three\r\nfour\r\nfive");
 
-        let anchor = term.take_apc_payloads()[0].0;
+        let anchor = apc_anchors(&term.take_graphics_events())[0];
 
         // Where is the anchored row *now*?
         let now = anchor.absolute_line - term.grid().scrolled_off() as i64;
@@ -3550,7 +3614,7 @@ mod tests {
         let mut parser: ansi::Processor = ansi::Processor::new();
 
         parser.advance(&mut term, b"\x1b_Gi=1;IMG\x1b\\");
-        let anchor = term.take_apc_payloads()[0].0;
+        let anchor = apc_anchors(&term.take_graphics_events())[0];
         let history_then = term.grid().history_size();
 
         // Scroll far past what scrollback can hold.
@@ -3577,7 +3641,7 @@ mod tests {
         let mut parser: ansi::Processor = ansi::Processor::new();
 
         parser.advance(&mut term, b"\r\n\x1b_Gi=1;IMG\x1b\\");
-        let anchor = term.take_apc_payloads()[0].0;
+        let anchor = apc_anchors(&term.take_graphics_events())[0];
         let now = anchor.absolute_line - term.grid().scrolled_off() as i64;
         assert_eq!(now, i64::from(term.grid().cursor.point.line.0));
     }
@@ -3596,7 +3660,7 @@ mod tests {
         assert!(offset > 0, "precondition: viewport is scrolled back");
 
         parser.advance(&mut term, b"\x1b_Gi=1;IMG\x1b\\");
-        assert_eq!(term.take_apc_payloads()[0].0.display_offset, offset);
+        assert_eq!(apc_anchors(&term.take_graphics_events())[0].display_offset, offset);
     }
 
     /// The scroll counter is deliberately **never** reset, including by RIS.
@@ -3616,5 +3680,130 @@ mod tests {
         parser.advance(&mut term, b"\x1bc"); // RIS
 
         assert_eq!(term.grid().scrolled_off(), before, "RIS must not rewind the counter");
+    }
+
+    // ---- screen events -----------------------------------------------------
+
+    /// The ERASE MODE must survive to the drain. The graphics protocol clears
+    /// images on `ED 2` but not on `ED 0` or `ED 1`, so a consumer told only
+    /// "the screen was erased" cannot implement that rule — and a test of the
+    /// rule could not fail. This is the acceptance criterion for the whole
+    /// queue, not a nicety.
+    #[test]
+    fn each_erase_mode_arrives_distinguishably() {
+        let cases: [(&[u8], ansi::ClearMode); 4] = [
+            (b"\x1b[0J", ansi::ClearMode::Below),
+            (b"\x1b[1J", ansi::ClearMode::Above),
+            (b"\x1b[2J", ansi::ClearMode::All),
+            (b"\x1b[3J", ansi::ClearMode::Saved),
+        ];
+        for (input, expected) in cases {
+            let size = TermSize::new(10, 3);
+            let mut term = Term::new(Config::default(), &size, VoidListener);
+            let mut parser: ansi::Processor = ansi::Processor::new();
+            parser.advance(&mut term, input);
+
+            let events = term.take_graphics_events();
+            assert_eq!(
+                events,
+                vec![GraphicsEvent::ClearScreen { mode: expected }],
+                "input {:?} must arrive as {:?}",
+                String::from_utf8_lossy(input),
+                expected,
+            );
+        }
+    }
+
+    /// The mirror: erases that are NOT `ED` must not masquerade as one. `EL`,
+    /// `DCH` and `ECH` all clear cells and none of them clears graphics.
+    #[test]
+    fn line_and_character_erases_are_not_screen_clears() {
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"hello\x1b[K\x1b[2P\x1b[3X\x1b[1K");
+
+        assert!(
+            term.take_graphics_events().is_empty(),
+            "EL, DCH and ECH must not produce a ClearScreen",
+        );
+    }
+
+    /// **The reason this is one queue and not two.** An image, an erase and a
+    /// second image can arrive in a single `read()`. Parallel queues drained
+    /// together would say "two images, one clear" with no way to tell which
+    /// image the clear applies to — which is the question the consumer exists
+    /// to answer.
+    #[test]
+    fn images_and_erases_keep_their_order() {
+        let size = TermSize::new(20, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b_Gi=1;FIRST\x1b\\\x1b[2J\x1b_Gi=2;SECOND\x1b\\");
+
+        let events = term.take_graphics_events();
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(&events[0], GraphicsEvent::Apc { payload, .. } if payload == b"Gi=1;FIRST")
+        );
+        assert_eq!(events[1], GraphicsEvent::ClearScreen { mode: ansi::ClearMode::All });
+        assert!(
+            matches!(&events[2], GraphicsEvent::Apc { payload, .. } if payload == b"Gi=2;SECOND")
+        );
+    }
+
+    #[test]
+    fn ris_arrives_as_a_reset() {
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b_Gi=1;IMG\x1b\\\x1bc");
+
+        let events = term.take_graphics_events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], GraphicsEvent::Apc { .. }));
+        assert_eq!(events[1], GraphicsEvent::Reset, "the image was placed before the reset");
+    }
+
+    #[test]
+    fn a_resize_is_reported_with_its_new_size() {
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let _ = term.take_graphics_events();
+
+        term.resize(TermSize::new(20, 5));
+
+        assert_eq!(
+            term.take_graphics_events(),
+            vec![GraphicsEvent::Resize { columns: 20, screen_lines: 5 }],
+        );
+    }
+
+    /// A resize to the same size is not a resize.
+    #[test]
+    fn a_no_op_resize_reports_nothing() {
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let _ = term.take_graphics_events();
+
+        term.resize(TermSize::new(10, 3));
+
+        assert!(term.take_graphics_events().is_empty());
+    }
+
+    /// Ordinary output produces no events at all, so the queue cannot grow
+    /// without bound on a terminal that never uses graphics.
+    #[test]
+    fn plain_text_produces_no_graphics_events() {
+        let size = TermSize::new(20, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"hello world\r\nsecond line\r\n\x1b[1;32mcoloured\x1b[0m");
+
+        assert!(term.take_graphics_events().is_empty());
     }
 }

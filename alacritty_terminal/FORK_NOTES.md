@@ -21,10 +21,30 @@ in the workspace `Cargo.toml` pointing at the zestful `vte` fork.
   arrived in the grid.
 - `Grid::scrolled_off() -> u64` and a `scrolled_off` field, counting lines ever
   scrolled off the top. Monotonic.
-- `Term::apc_payloads: Vec<(ApcAnchor, Vec<u8>)>`, `Term::take_apc_payloads()`,
-  `Term::has_apc_payloads()`.
+- `pub enum GraphicsEvent { Apc, ClearScreen, Reset, Resize }` — everything the
+  graphics layer must know happened, **in stream order**.
+- `Term::graphics_events: Vec<GraphicsEvent>`,
+  `Term::take_graphics_events()`, `Term::has_graphics_events()`.
 - `Handler::apc_dispatch` on `impl<T: EventListener> Handler for Term<T>`,
-  capturing the anchor and pushing onto that queue.
+  capturing the anchor and pushing an `Apc` event; `clear_screen`, `reset_state`
+  and `Term::resize` push theirs.
+
+### Why one queue and not several
+
+An image, an erase and a second image arrive in a single `read()` —
+`<image> ESC[2J <image>` is ordinary output. Parallel queues drained together
+would report "two images, one clear" with no way to say which image the clear
+applies to, which is the only question the consumer has. Same shape as the
+anchor: information that exists at one moment, discarded before anyone can use
+it.
+
+### Why the erase mode is carried
+
+`ClearScreen` carries `ansi::ClearMode` rather than collapsing to "erased". The
+graphics protocol clears images on `ED 2` and **not** on `ED 0` or `ED 1`, so a
+consumer given only "the screen was erased" cannot implement that rule — and a
+test of the rule could not fail. `EL`, `DCH` and `ECH` produce no event at all,
+which is pinned by its own test.
 
 It deliberately does **no interpretation** of the payload: `Term` does not know
 what the kitty graphics protocol is.
