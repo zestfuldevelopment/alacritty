@@ -69,9 +69,13 @@ two already:
 - **`clear_scrollback`.** Rows still on screen are unaffected, since nothing
   scrolled. Rows that were in scrollback are gone and their anchors name
   nothing.
-- **RIS.** Resets the grid and the counter. Every prior anchor is meaningless
-  afterwards and none is detectable as stale from its value alone — discard them
-  on reset.
+- **RIS.** Resets the grid but **not** the counter, which is never reset at all.
+  Prior anchors are meaningless afterwards and must be discarded by the
+  consumer; RIS clears every image anyway. Do not test `scrolled_off() == 0` to
+  detect staleness — it never returns to zero. Not resetting is deliberate: a
+  counter that rewound would reuse row numbers, so a stale anchor could resolve
+  to a *plausible* wrong row. Never reusing a value means it resolves far
+  outside the grid instead, where it is obviously invalid.
 
 ## Why this fork exists at all
 

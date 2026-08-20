@@ -305,9 +305,13 @@ pub struct ApcAnchor {
     ///   outlive it. Rows still on screen are unaffected, because nothing
     ///   scrolled; rows that were in scrollback are gone and their anchors now
     ///   name nothing.
-    /// - **RIS.** Resets the grid, and the counter with it. Every anchor taken
-    ///   beforehand is meaningless afterwards, and none is detectable as stale
-    ///   from its value alone — discard them on reset.
+    /// - **RIS.** Resets the grid but **not** the counter, which is never
+    ///   reset. Anchors taken beforehand are meaningless afterwards and must be
+    ///   discarded by the consumer — RIS clears every image in any case.
+    ///   Do **not** try to detect staleness by testing `scrolled_off() == 0`:
+    ///   it never returns to zero. The counter's monotonicity is what keeps
+    ///   this safe, since a stale anchor resolves far outside the grid rather
+    ///   than to a plausible wrong row.
     pub absolute_line: i64,
 
     /// Scrollback offset of the viewport at that moment.
@@ -3593,5 +3597,24 @@ mod tests {
 
         parser.advance(&mut term, b"\x1b_Gi=1;IMG\x1b\\");
         assert_eq!(term.take_apc_payloads()[0].0.display_offset, offset);
+    }
+
+    /// The scroll counter is deliberately **never** reset, including by RIS.
+    /// Monotonicity is what makes a stale anchor resolve to an obviously
+    /// invalid row rather than a plausible wrong one, so this is load-bearing
+    /// rather than an oversight. Pinned so that "fixing" it fails here.
+    #[test]
+    fn scrolled_off_survives_ris() {
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"a\r\nb\r\nc\r\nd\r\n");
+        let before = term.grid().scrolled_off();
+        assert!(before > 0, "precondition: something scrolled");
+
+        parser.advance(&mut term, b"\x1bc"); // RIS
+
+        assert_eq!(term.grid().scrolled_off(), before, "RIS must not rewind the counter");
     }
 }

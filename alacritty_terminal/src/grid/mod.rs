@@ -142,7 +142,13 @@ pub struct Grid<T> {
     /// absolute row coordinate: `scrolled_off + line` names a row independently
     /// of how much has scrolled past since.
     ///
-    /// Reset only when the grid itself is reset.
+    /// **Never reset**, including by [`Grid::reset`] and therefore by RIS. That
+    /// is deliberate: monotonicity is the property that makes the coordinate
+    /// safe. A counter that returned to zero would start handing out row
+    /// numbers it had used before, so an anchor taken before the reset could
+    /// resolve to a *plausible* wrong row afterwards. Never reusing a value
+    /// means a stale anchor always resolves far outside the grid instead, where
+    /// it is obviously invalid.
     ///
     /// `serde(default)` so upstream's serialised ref-test fixtures — which
     /// predate this field — still deserialise unmodified.
