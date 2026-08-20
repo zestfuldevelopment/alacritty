@@ -265,6 +265,40 @@ impl TermDamageState {
     }
 }
 
+/// Where an APC arrived in the grid, captured at dispatch time.
+///
+/// The kitty graphics protocol anchors a placement at the cursor position when
+/// the final chunk is received. That position is **not recoverable later**:
+/// anything following the escape in the same `read()` — a shell prompt after
+/// `icat`, which is the ordinary case — is parsed before the embedder gets to
+/// look, so by then the cursor has moved on. Hence capture at dispatch, not at
+/// drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApcAnchor {
+    /// Cursor position at the moment the payload was dispatched.
+    pub point: Point,
+
+    /// Scrollback offset of the viewport at that moment.
+    pub display_offset: usize,
+
+    /// Scrollback depth at that moment.
+    ///
+    /// Bytes following the APC in the same `read()` can *scroll* the grid, not
+    /// just advance the cursor along a line, which makes `point.line` stale in
+    /// the same way the column was. The difference between this and
+    /// `history_size()` at drain time is how far the anchored row has since
+    /// moved up.
+    ///
+    /// **This correction has a limit, and it is a real one.** `history_size()`
+    /// is `total_lines - screen_lines`, so it stops growing once the scrollback
+    /// buffer is full; alacritty keeps no monotonic count of lines ever
+    /// scrolled. Once saturated, the delta under-reports and the anchored row
+    /// cannot be located from these fields alone. A row that scrolls out of
+    /// scrollback entirely is gone in any case, so the residual is confined to
+    /// images anchored shortly before a scroll burst on a saturated buffer.
+    pub history_size: usize,
+}
+
 pub struct Term<T> {
     /// APC payloads received since the last drain, oldest first.
     ///
@@ -274,7 +308,7 @@ pub struct Term<T> {
     /// where it lands. It is a queue rather than a callback because `Term` is
     /// filled on alacritty's event-loop thread behind a `FairMutex` and read
     /// from another thread — see `take_apc_payloads`.
-    apc_payloads: Vec<Vec<u8>>,
+    apc_payloads: Vec<(ApcAnchor, Vec<u8>)>,
 
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
@@ -1070,11 +1104,13 @@ impl<T> Dimensions for Term<T> {
 impl<T> Term<T> {
     /// Take every APC payload received since the last call, oldest first.
     ///
+    /// Each payload is paired with the [`ApcAnchor`] captured when it arrived.
+    ///
     /// **zestful addition to upstream alacritty_terminal.** Draining rather
     /// than borrowing keeps the `FairMutex` held for the move alone: the caller
     /// takes the lock, swaps the queue out, and releases it before decoding.
     #[inline]
-    pub fn take_apc_payloads(&mut self) -> Vec<Vec<u8>> {
+    pub fn take_apc_payloads(&mut self) -> Vec<(ApcAnchor, Vec<u8>)> {
         core::mem::take(&mut self.apc_payloads)
     }
 
@@ -1086,15 +1122,21 @@ impl<T> Term<T> {
 }
 
 impl<T: EventListener> Handler for Term<T> {
-    /// **zestful addition.** Queue an APC payload for the embedder to drain.
+    /// **zestful addition.** Queue an APC payload, with the cursor position it
+    /// arrived at, for the embedder to drain.
     ///
-    /// Deliberately does no interpretation: `Term` does not know what the
-    /// kitty graphics protocol is, and the anchoring rules need the cursor
-    /// position at the moment the payload arrived, which the embedder reads
-    /// from this same locked `Term`.
+    /// Deliberately does no interpretation: `Term` does not know what the kitty
+    /// graphics protocol is. But it *must* capture the anchor here rather than
+    /// leave it to the embedder, because this is the only moment the position
+    /// still exists — see [`ApcAnchor`].
     #[inline]
     fn apc_dispatch(&mut self, bytes: &[u8]) {
-        self.apc_payloads.push(bytes.to_vec());
+        let anchor = ApcAnchor {
+            point: self.grid.cursor.point,
+            display_offset: self.grid.display_offset(),
+            history_size: self.grid.history_size(),
+        };
+        self.apc_payloads.push((anchor, bytes.to_vec()));
     }
 
     /// A character to be displayed.
@@ -3353,7 +3395,9 @@ mod tests {
         parser.advance(&mut term, b"\x1b_Gf=100,a=T,i=1;iVBORw0KGgo=\x1b\\");
 
         assert!(term.has_apc_payloads());
-        assert_eq!(term.take_apc_payloads(), vec![b"Gf=100,a=T,i=1;iVBORw0KGgo=".to_vec()]);
+        let drained = term.take_apc_payloads();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].1, b"Gf=100,a=T,i=1;iVBORw0KGgo=".to_vec());
         assert!(!term.has_apc_payloads(), "draining must empty the queue");
     }
 
@@ -3367,7 +3411,7 @@ mod tests {
 
         parser.advance(&mut term, b"AB\x1b_Gi=1;DATA\x1b\\CD");
 
-        assert_eq!(term.take_apc_payloads(), vec![b"Gi=1;DATA".to_vec()]);
+        assert_eq!(term.take_apc_payloads()[0].1, b"Gi=1;DATA".to_vec());
         let row: String = (0..4).map(|c| term.grid[Line(0)][Column(c)].c).collect();
         assert_eq!(row, "ABCD");
     }
@@ -3384,11 +3428,103 @@ mod tests {
         parser.advance(&mut term, b"\x1b_Gm=1;BBBB\x1b\\");
         parser.advance(&mut term, b"\x1b_Gm=0;CCCC\x1b\\");
 
-        assert_eq!(term.take_apc_payloads(), vec![
+        let payloads: Vec<Vec<u8>> =
+            term.take_apc_payloads().into_iter().map(|(_, b)| b).collect();
+        assert_eq!(payloads, vec![
             b"Gi=1,m=1;AAAA".to_vec(),
             b"Gm=1;BBBB".to_vec(),
             b"Gm=0;CCCC".to_vec(),
         ]);
+    }
+
+
+
+
+    /// The anchor is captured where the image arrived, NOT where the cursor
+    /// ended up. Regression: the queue used to carry bytes only, so a shell
+    /// prompt following `icat` in the same read moved the cursor six columns
+    /// before the embedder could look, and the placement anchored there.
+    #[test]
+    fn anchor_is_captured_at_dispatch_not_at_drain() {
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"AB\x1b_Ga=T,i=1;DATA\x1b\\CDEFGH");
+
+        let drained = term.take_apc_payloads();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0.point, Point::new(Line(0), Column(2)), "anchored where the image was");
+        assert_eq!(term.grid().cursor.point, Point::new(Line(0), Column(8)), "cursor has moved on since");
+    }
+
+    /// Two images in one read anchor independently.
+    #[test]
+    fn each_image_in_one_read_gets_its_own_anchor() {
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"A\x1b_Gi=1;ONE\x1b\\BB\x1b_Gi=2;TWO\x1b\\CCC");
+
+        let drained = term.take_apc_payloads();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].0.point.column, Column(1));
+        assert_eq!(drained[1].0.point.column, Column(3));
+    }
+
+    /// Newlines after an image move it up a line; the captured line is the one
+    /// it arrived on.
+    #[test]
+    fn anchor_survives_lines_added_after_it() {
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\r\n\r\n\x1b_Gi=1;IMG\x1b\\\r\nafter");
+
+        let drained = term.take_apc_payloads();
+        assert_eq!(drained[0].0.point.line, Line(2), "arrived on the third line");
+    }
+
+    /// `history_size` is what makes a scrolled anchor recoverable: bytes after
+    /// the image can scroll the grid, so `point.line` alone is stale by drain
+    /// time. The delta is how far the anchored row has moved up.
+    #[test]
+    fn history_size_delta_measures_scrolling_after_the_anchor() {
+        let size = TermSize::new(20, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // Fill the screen, place the image on the last line, then scroll past it.
+        parser.advance(&mut term, b"one\r\ntwo\r\n\x1b_Gi=1;IMG\x1b\\three\r\nfour\r\nfive");
+
+        let drained = term.take_apc_payloads();
+        let anchor = drained[0].0;
+
+        let scrolled = term.grid().history_size() - anchor.history_size;
+        assert_eq!(scrolled, 2, "two lines scrolled after the image arrived");
+
+        // The row the image was anchored to, in the grid's coordinates now.
+        let now = anchor.point.line - scrolled as i32;
+        assert_eq!(now, Line(0), "the anchored row moved from line 2 up to line 0");
+    }
+
+    /// The anchor records the viewport offset too, so an image placed while
+    /// scrolled back is not mislocated.
+    #[test]
+    fn anchor_records_the_display_offset() {
+        let size = TermSize::new(20, 2);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"a\r\nb\r\nc\r\nd\r\n");
+        term.scroll_display(Scroll::Delta(2));
+        let offset = term.grid().display_offset();
+        assert!(offset > 0, "precondition: viewport is scrolled back");
+
+        parser.advance(&mut term, b"\x1b_Gi=1;IMG\x1b\\");
+        assert_eq!(term.take_apc_payloads()[0].0.display_offset, offset);
     }
 
 }

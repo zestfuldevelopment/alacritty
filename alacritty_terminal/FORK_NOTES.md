@@ -17,15 +17,34 @@ Our work is on branch **`zestful/apc-queue`**, pinned **by rev** in
 One file, `alacritty_terminal/src/term/mod.rs`, plus a `[patch.crates-io]` entry
 in the workspace `Cargo.toml` pointing at the zestful `vte` fork.
 
-- `Term::apc_payloads: Vec<Vec<u8>>` — a queue of APC payloads received since
-  the last drain.
+- `pub struct ApcAnchor { point, display_offset, history_size }` — where an APC
+  arrived in the grid.
+- `Term::apc_payloads: Vec<(ApcAnchor, Vec<u8>)>` — APC payloads received since
+  the last drain, each with its anchor.
 - `Term::take_apc_payloads()` and `Term::has_apc_payloads()`.
 - `Handler::apc_dispatch` on `impl<T: EventListener> Handler for Term<T>`,
-  pushing onto that queue.
+  capturing the anchor and pushing onto that queue.
 
-It deliberately does **no interpretation**. `Term` does not know what the kitty
-graphics protocol is; the placement rules need the cursor position at the moment
-the payload arrived, which the embedder reads from this same locked `Term`.
+It deliberately does **no interpretation** of the payload: `Term` does not know
+what the kitty graphics protocol is.
+
+It does, however, have to capture the **anchor**, and that is not a convenience.
+The protocol places an image at the cursor position when the final chunk
+arrives, and **that position does not survive the call**: anything following the
+escape in the same `read()` is parsed before the embedder regains control, so by
+drain time the cursor has moved. A shell prompt printed after an image is the
+ordinary case, not a corner one. Capturing at dispatch is the only correct
+option available.
+
+`history_size` is captured for the same reason one step out: following bytes can
+*scroll* the grid, not merely advance the cursor, which makes `point.line` stale
+exactly as the column was. Its delta at drain time is how far the anchored row
+has moved. **The correction saturates** — `history_size` is
+`total_lines - screen_lines` and stops growing once scrollback is full, and this
+crate keeps no monotonic count of lines ever scrolled, so an image anchored
+shortly before a scroll burst on a full buffer cannot be located from these
+fields alone. A row scrolled out of scrollback is gone regardless; the residual
+is narrow, and it is stated rather than hidden.
 
 ## Why this fork exists at all
 
