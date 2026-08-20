@@ -278,25 +278,46 @@ pub struct ApcAnchor {
     /// Cursor position at the moment the payload was dispatched.
     pub point: Point,
 
-    /// Scrollback offset of the viewport at that moment.
-    pub display_offset: usize,
+    /// Absolute row, stable across later scrolling.
+    ///
+    /// `Grid::scrolled_off() + point.line` at dispatch. Bytes following an APC
+    /// in the same `read()` can *scroll* the grid, not merely advance the
+    /// cursor, so [`Self::point`]'s line is stale by drain time in exactly the
+    /// way its column was. This is not: to find the row now, subtract
+    /// `Grid::scrolled_off()` as it is *then*.
+    ///
+    /// It is deliberately an absolute coordinate rather than a counter for the
+    /// consumer to subtract. The position can only be answered correctly at
+    /// dispatch, so it is answered once, here.
+    ///
+    /// Signed because the row may have scrolled above the current screen, in
+    /// which case it is negative relative to the viewport — that is a row in
+    /// scrollback, or gone entirely.
+    ///
+    /// # Three cases where an anchor does not mean what it looks like
+    ///
+    /// - **Alternate screen.** The alt grid keeps no history, so lines that
+    ///   scroll off are discarded rather than accumulated. The counter still
+    ///   advances, so an anchor remains valid *within* that screen — but each
+    ///   screen has its own grid and its own counter, so an anchor taken on one
+    ///   is meaningless against the other. Track placements per screen.
+    /// - **`clear_scrollback`.** Drops history beneath an anchor that may
+    ///   outlive it. Rows still on screen are unaffected, because nothing
+    ///   scrolled; rows that were in scrollback are gone and their anchors now
+    ///   name nothing.
+    /// - **RIS.** Resets the grid, and the counter with it. Every anchor taken
+    ///   beforehand is meaningless afterwards, and none is detectable as stale
+    ///   from its value alone — discard them on reset.
+    pub absolute_line: i64,
 
-    /// Scrollback depth at that moment.
+    /// Scrollback offset of the viewport at that moment.
     ///
-    /// Bytes following the APC in the same `read()` can *scroll* the grid, not
-    /// just advance the cursor along a line, which makes `point.line` stale in
-    /// the same way the column was. The difference between this and
-    /// `history_size()` at drain time is how far the anchored row has since
-    /// moved up.
-    ///
-    /// **This correction has a limit, and it is a real one.** `history_size()`
-    /// is `total_lines - screen_lines`, so it stops growing once the scrollback
-    /// buffer is full; alacritty keeps no monotonic count of lines ever
-    /// scrolled. Once saturated, the delta under-reports and the anchored row
-    /// cannot be located from these fields alone. A row that scrolls out of
-    /// scrollback entirely is gone in any case, so the residual is confined to
-    /// images anchored shortly before a scroll burst on a saturated buffer.
-    pub history_size: usize,
+    /// Note this is **not** a scroll compensator: `Grid::scroll_up` leaves it
+    /// untouched while the viewport is pinned to the active area, which is
+    /// where output normally arrives. Use [`Self::absolute_line`] for that. It
+    /// is recorded because an image placed while the user is scrolled back
+    /// needs to know where the viewport was.
+    pub display_offset: usize,
 }
 
 pub struct Term<T> {
@@ -1133,8 +1154,9 @@ impl<T: EventListener> Handler for Term<T> {
     fn apc_dispatch(&mut self, bytes: &[u8]) {
         let anchor = ApcAnchor {
             point: self.grid.cursor.point,
+            absolute_line: self.grid.scrolled_off() as i64
+                + i64::from(self.grid.cursor.point.line.0),
             display_offset: self.grid.display_offset(),
-            history_size: self.grid.history_size(),
         };
         self.apc_payloads.push((anchor, bytes.to_vec()));
     }
@@ -3428,17 +3450,12 @@ mod tests {
         parser.advance(&mut term, b"\x1b_Gm=1;BBBB\x1b\\");
         parser.advance(&mut term, b"\x1b_Gm=0;CCCC\x1b\\");
 
-        let payloads: Vec<Vec<u8>> =
-            term.take_apc_payloads().into_iter().map(|(_, b)| b).collect();
-        assert_eq!(payloads, vec![
-            b"Gi=1,m=1;AAAA".to_vec(),
-            b"Gm=1;BBBB".to_vec(),
-            b"Gm=0;CCCC".to_vec(),
-        ]);
+        let payloads: Vec<Vec<u8>> = term.take_apc_payloads().into_iter().map(|(_, b)| b).collect();
+        assert_eq!(
+            payloads,
+            vec![b"Gi=1,m=1;AAAA".to_vec(), b"Gm=1;BBBB".to_vec(), b"Gm=0;CCCC".to_vec(),]
+        );
     }
-
-
-
 
     /// The anchor is captured where the image arrived, NOT where the cursor
     /// ended up. Regression: the queue used to carry bytes only, so a shell
@@ -3454,8 +3471,16 @@ mod tests {
 
         let drained = term.take_apc_payloads();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].0.point, Point::new(Line(0), Column(2)), "anchored where the image was");
-        assert_eq!(term.grid().cursor.point, Point::new(Line(0), Column(8)), "cursor has moved on since");
+        assert_eq!(
+            drained[0].0.point,
+            Point::new(Line(0), Column(2)),
+            "anchored where the image was"
+        );
+        assert_eq!(
+            term.grid().cursor.point,
+            Point::new(Line(0), Column(8)),
+            "cursor has moved on since"
+        );
     }
 
     /// Two images in one read anchor independently.
@@ -3487,27 +3512,70 @@ mod tests {
         assert_eq!(drained[0].0.point.line, Line(2), "arrived on the third line");
     }
 
-    /// `history_size` is what makes a scrolled anchor recoverable: bytes after
-    /// the image can scroll the grid, so `point.line` alone is stale by drain
-    /// time. The delta is how far the anchored row has moved up.
+    /// The absolute anchor survives scrolling that happens after the image
+    /// arrived — which is the whole point, since a shell prompt following
+    /// `icat` scrolls the grid in the same read.
     #[test]
-    fn history_size_delta_measures_scrolling_after_the_anchor() {
+    fn absolute_anchor_survives_scrolling_after_it() {
         let size = TermSize::new(20, 3);
         let mut term = Term::new(Config::default(), &size, VoidListener);
         let mut parser: ansi::Processor = ansi::Processor::new();
 
-        // Fill the screen, place the image on the last line, then scroll past it.
         parser.advance(&mut term, b"one\r\ntwo\r\n\x1b_Gi=1;IMG\x1b\\three\r\nfour\r\nfive");
 
-        let drained = term.take_apc_payloads();
-        let anchor = drained[0].0;
+        let anchor = term.take_apc_payloads()[0].0;
 
-        let scrolled = term.grid().history_size() - anchor.history_size;
-        assert_eq!(scrolled, 2, "two lines scrolled after the image arrived");
+        // Where is the anchored row *now*?
+        let now = anchor.absolute_line - term.grid().scrolled_off() as i64;
+        assert_eq!(now, 0, "the row the image was on has scrolled up to line 0");
 
-        // The row the image was anchored to, in the grid's coordinates now.
-        let now = anchor.point.line - scrolled as i32;
-        assert_eq!(now, Line(0), "the anchored row moved from line 2 up to line 0");
+        // And it still holds the text that was on it when the image arrived.
+        let row: String = (0..5).map(|c| term.grid()[Line(now as i32)][Column(c)].c).collect();
+        assert_eq!(row.trim_end(), "three");
+    }
+
+    /// The reason the anchor is absolute rather than a `history_size` delta:
+    /// `history_size` saturates once scrollback is full, and then a delta
+    /// under-reports. `scrolled_off` does not.
+    #[test]
+    fn absolute_anchor_still_works_when_scrollback_is_saturated() {
+        let size = TermSize::new(10, 2);
+        let mut config = Config::default();
+        config.scrolling_history = 2; // tiny, so it saturates immediately
+        let mut term = Term::new(config, &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b_Gi=1;IMG\x1b\\");
+        let anchor = term.take_apc_payloads()[0].0;
+        let history_then = term.grid().history_size();
+
+        // Scroll far past what scrollback can hold.
+        for _ in 0..20 {
+            parser.advance(&mut term, b"x\r\n");
+        }
+
+        let history_delta = term.grid().history_size() - history_then;
+        let true_scroll = term.grid().scrolled_off() as i64 - anchor.absolute_line;
+
+        assert_eq!(history_delta, 2, "history_size saturated at the 2-line limit");
+        assert!(
+            true_scroll > history_delta as i64,
+            "scrolled_off kept counting ({true_scroll}) where history_size stopped ({history_delta}) \
+             -- this is exactly what a delta-based anchor would have got wrong",
+        );
+    }
+
+    /// An anchor taken with nothing following it points at the live cursor row.
+    #[test]
+    fn absolute_anchor_matches_the_cursor_when_nothing_follows() {
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\r\n\x1b_Gi=1;IMG\x1b\\");
+        let anchor = term.take_apc_payloads()[0].0;
+        let now = anchor.absolute_line - term.grid().scrolled_off() as i64;
+        assert_eq!(now, i64::from(term.grid().cursor.point.line.0));
     }
 
     /// The anchor records the viewport offset too, so an image placed while
@@ -3526,5 +3594,4 @@ mod tests {
         parser.advance(&mut term, b"\x1b_Gi=1;IMG\x1b\\");
         assert_eq!(term.take_apc_payloads()[0].0.display_offset, offset);
     }
-
 }

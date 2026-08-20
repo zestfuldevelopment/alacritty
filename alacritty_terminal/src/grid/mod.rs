@@ -133,6 +133,22 @@ pub struct Grid<T> {
     /// updates this offset accordingly.
     display_offset: usize,
 
+    /// Total lines ever scrolled off the top of this grid. Monotonic.
+    ///
+    /// **zestful addition.** Unlike `history_size()`, which is
+    /// `total_lines - screen_lines` and stops growing once the scrollback
+    /// buffer is full, this counts lines that *left the screen* whether or not
+    /// scrollback had room to keep them. That makes it a stable origin for an
+    /// absolute row coordinate: `scrolled_off + line` names a row independently
+    /// of how much has scrolled past since.
+    ///
+    /// Reset only when the grid itself is reset.
+    ///
+    /// `serde(default)` so upstream's serialised ref-test fixtures — which
+    /// predate this field — still deserialise unmodified.
+    #[cfg_attr(feature = "serde", serde(default))]
+    scrolled_off: u64,
+
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
 }
@@ -143,6 +159,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             raw: Storage::with_capacity(lines, columns),
             max_scroll_limit,
             display_offset: 0,
+            scrolled_off: 0,
             saved_cursor: Cursor::default(),
             cursor: Cursor::default(),
             lines,
@@ -270,6 +287,11 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Only rotate the entire history if the active region starts at the top.
         if region.start == 0 {
+            // zestful: lines leave the screen here whether or not scrollback has
+            // room for them, which is why this counts rotations and not history
+            // growth.
+            self.scrolled_off += positions as u64;
+
             // Create scrollback for the new lines.
             self.increase_scroll_limit(positions);
 
@@ -429,6 +451,16 @@ impl<T> Grid<T> {
     }
 
     #[inline]
+    /// Total lines ever scrolled off the top of this grid. Monotonic.
+    ///
+    /// **zestful addition.** Convert a [`Line`] to a coordinate that survives
+    /// later scrolling with `scrolled_off() as i64 + line.0 as i64`, and back
+    /// again by subtracting `scrolled_off()` as it is *then*.
+    #[inline]
+    pub fn scrolled_off(&self) -> u64 {
+        self.scrolled_off
+    }
+
     pub fn display_offset(&self) -> usize {
         self.display_offset
     }
