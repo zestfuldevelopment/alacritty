@@ -1402,7 +1402,37 @@ impl<T: EventListener> Handler for Term<T> {
         match intermediate {
             None => {
                 trace!("Reporting primary device attributes");
-                let text = String::from("\x1b[?6c");
+                // ZESTFUL FORK: `\x1b[?6c` upstream, `\x1b[?62;c` here.
+                //
+                // THIS IS A COMPATIBILITY CHOICE AND NOT A CONFORMANCE CLAIM.
+                // `62` is what kitty answers. It is here because a
+                // PARAMETERLESS primary DA is not accepted by every client:
+                // `kitten icat` waits for a reply it can parse, does not
+                // accept `\x1b[?6c` as one, and exits with "Timed out waiting
+                // for a response from the terminal". Measured against the real
+                // client with the graphics protocol fully working and every
+                // capability probe answered `OK`, so it is the DA and nothing
+                // downstream of it; reproduced by capturing this very byte
+                // string off a live pane and replaying it at the client. Any
+                // answer containing a `;` was accepted.
+                //
+                // `62` NAMES VT220. NOBODY ENUMERATED THIS TERMINAL'S VT220
+                // CONFORMANCE AND THIS LINE IS NOT THE OUTPUT OF AN AUDIT. It
+                // was chosen so that a DA answer PARSES at clients which
+                // reject a parameterless one, and the cost of saying VT220
+                // without having audited VT220 was put to the repository owner
+                // and accepted knowingly. Documenting it as a capability claim
+                // would be the same defect as documenting a safety margin as a
+                // measurement.
+                //
+                // Upstream alacritty has the same interop hole; whether to
+                // report it there is a separate, outward-facing decision.
+                //
+                // Pinned by `our_primary_da_answer_carries_a_parameter` in
+                // zestful-terminal's `fork_surface.rs`, which drives `ESC [ c`
+                // and asserts on THE BYTES EMITTED -- so bumping this crate's
+                // rev backwards is a failing test rather than a silent revert.
+                let text = String::from("\x1b[?62;c");
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
             Some('>') => {
