@@ -456,7 +456,6 @@ impl<T> Grid<T> {
         GridIterator { grid: self, point: start, end }
     }
 
-    #[inline]
     /// Total lines ever scrolled off the top of this grid. Monotonic.
     ///
     /// **zestful addition.** Convert a [`Line`] to a coordinate that survives

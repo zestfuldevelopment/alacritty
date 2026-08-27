@@ -265,23 +265,36 @@ impl TermDamageState {
     }
 }
 
-/// Where an APC arrived in the grid, captured at dispatch time.
+/// Where a queued escape arrived in the grid, captured at dispatch time.
+///
+/// **Named for the moment, not for the caller.** It was `ApcAnchor` while APC
+/// was its only user; [`UnhandledOsc`] is the second, and a type named for one
+/// of two consumers misleads everyone who has not opened this file. The
+/// property it denotes was never about APC — it is *where the parser was when
+/// this arrived* — so the name is now the concept.
 ///
 /// The kitty graphics protocol anchors a placement at the cursor position when
-/// the final chunk is received. That position is **not recoverable later**:
-/// anything following the escape in the same `read()` — a shell prompt after
-/// `icat`, which is the ordinary case — is parsed before the embedder gets to
-/// look, so by then the cursor has moved on. Hence capture at dispatch, not at
-/// drain.
+/// the final chunk is received; OSC 133 marks a prompt at the cursor position
+/// when the mark arrives. In both cases that position is **not recoverable
+/// later**: anything following the escape in the same `read()` — a shell prompt
+/// after `icat`, or a command's entire output after its prompt mark, which are
+/// the ordinary cases — is parsed before the embedder gets to look, so by then
+/// the cursor has moved on. Hence capture at dispatch, not at drain.
+///
+/// Measured rather than argued, on the OSC 133 side, at a 5-row grid with seven
+/// lines of output following the mark in one `advance`: the mark's true
+/// absolute row is `0` and a drain-time read computes `7`. The error is the
+/// volume of output that followed, so it is unbounded in use and zero in any
+/// test whose command prints nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ApcAnchor {
+pub struct DispatchAnchor {
     /// Cursor position at the moment the payload was dispatched.
     pub point: Point,
 
     /// Absolute row, stable across later scrolling.
     ///
-    /// `Grid::scrolled_off() + point.line` at dispatch. Bytes following an APC
-    /// in the same `read()` can *scroll* the grid, not merely advance the
+    /// `Grid::scrolled_off() + point.line` at dispatch. Bytes following the
+    /// escape in the same `read()` can *scroll* the grid, not merely advance the
     /// cursor, so [`Self::point`]'s line is stale by drain time in exactly the
     /// way its column was. This is not: to find the row now, subtract
     /// `Grid::scrolled_off()` as it is *then*.
@@ -336,7 +349,7 @@ pub struct ApcAnchor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphicsEvent {
     /// An APC payload, with where the cursor was when it arrived.
-    Apc { anchor: ApcAnchor, payload: Vec<u8> },
+    Apc { anchor: DispatchAnchor, payload: Vec<u8> },
 
     /// `ED` — erase in display.
     ///
@@ -370,6 +383,20 @@ pub enum GraphicsEvent {
 /// remove. `vte`'s own doc for the hook says the same in the other direction:
 /// implementing one is "a match arm here rather than a second parser in the
 /// embedder's PTY read path".
+///
+/// # An anchor is not an interpretation
+///
+/// The section above argues this type must not PARSE, and it still must not.
+/// [`Self::anchor`] does not: it records where the parser was, which is a fact
+/// about the stream rather than about the sequence's meaning, and `Term` still
+/// does not know what OSC 133 is.
+///
+/// The distinction that matters is who CAN answer. Growing a parsed field
+/// couples this fork to the embedder's OSC set — the coupling the passthrough
+/// exists to remove — because the embedder could have parsed it itself. The
+/// position could not: it exists only at dispatch and is gone by the drain, so
+/// declining to record it does not leave the work to the embedder, it destroys
+/// the answer. See [`DispatchAnchor`], which makes that case generally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnhandledOsc {
     /// The raw semicolon-split sequence, owned. `params[0]` is the OSC number.
@@ -377,6 +404,23 @@ pub struct UnhandledOsc {
     /// Owned because the borrow `vte` passes lives only for the dispatch call,
     /// and this queue outlives it by design — see [`Term::take_unhandled_oscs`].
     pub params: Vec<Vec<u8>>,
+
+    /// Where the parser was when this OSC arrived.
+    ///
+    /// **Carried for every unhandled OSC, not only the ones that want it**, and
+    /// the reason is that the alternative is not "carry it later" but "cannot".
+    /// A consumer that discovers it needs a position discovers it too late; by
+    /// then the queue has been drained and the grid has moved on.
+    ///
+    /// Most OSCs do not care. OSC 9;4 progress and OSC 777 notifications are
+    /// about the pane, not about a place in it, and their handlers ignore this.
+    /// OSC 133's four marks are positions by definition — a prompt mark whose
+    /// row is unknown cannot be navigated to — and that is what this is for.
+    ///
+    /// See [`DispatchAnchor`] for the conversion back to a live row, and for
+    /// the three cases (alternate screen, `clear_scrollback`, RIS) where an
+    /// anchor does not mean what it looks like.
+    pub anchor: DispatchAnchor,
 }
 
 pub struct Term<T> {
@@ -1208,7 +1252,7 @@ impl<T> Dimensions for Term<T> {
 impl<T> Term<T> {
     /// Take every graphics event since the last call, in stream order.
     ///
-    /// APC payloads carry the [`ApcAnchor`] captured when they arrived.
+    /// APC payloads carry the [`DispatchAnchor`] captured when they arrived.
     ///
     /// **zestful addition to upstream alacritty_terminal.** Draining rather
     /// than borrowing keeps the `FairMutex` held for the move alone: the caller
@@ -1249,10 +1293,10 @@ impl<T: EventListener> Handler for Term<T> {
     /// Deliberately does no interpretation: `Term` does not know what the kitty
     /// graphics protocol is. But it *must* capture the anchor here rather than
     /// leave it to the embedder, because this is the only moment the position
-    /// still exists — see [`ApcAnchor`].
+    /// still exists — see [`DispatchAnchor`].
     #[inline]
     fn apc_dispatch(&mut self, bytes: &[u8]) {
-        let anchor = ApcAnchor {
+        let anchor = DispatchAnchor {
             point: self.grid.cursor.point,
             absolute_line: self.grid.scrolled_off() as i64
                 + i64::from(self.grid.cursor.point.line.0),
@@ -1277,8 +1321,19 @@ impl<T: EventListener> Handler for Term<T> {
     /// that vocabulary grew.
     #[inline]
     fn osc_unhandled(&mut self, params: &[&[u8]]) {
+        // The anchor is captured HERE and cannot be captured anywhere else --
+        // `Term::take_unhandled_oscs` runs after a whole `read()` is parsed, so
+        // the cursor has moved and, if the output scrolled, the row this OSC
+        // marked is no longer the row the cursor is on. Same defect, same
+        // remedy and same shape as `apc_dispatch` below.
+        let anchor = DispatchAnchor {
+            point: self.grid.cursor.point,
+            absolute_line: self.grid.scrolled_off() as i64
+                + i64::from(self.grid.cursor.point.line.0),
+            display_offset: self.grid.display_offset(),
+        };
         self.unhandled_oscs
-            .push(UnhandledOsc { params: params.iter().map(|p| p.to_vec()).collect() });
+            .push(UnhandledOsc { params: params.iter().map(|p| p.to_vec()).collect(), anchor });
     }
 
     /// A character to be displayed.
@@ -3573,7 +3628,7 @@ mod tests {
             .collect()
     }
 
-    fn apc_anchors(events: &[GraphicsEvent]) -> Vec<ApcAnchor> {
+    fn apc_anchors(events: &[GraphicsEvent]) -> Vec<DispatchAnchor> {
         events
             .iter()
             .filter_map(|e| match e {
@@ -3636,6 +3691,49 @@ mod tests {
         assert_eq!(drained[0].params[0], b"133".to_vec());
         assert_eq!(drained[0].params[1], b"A".to_vec(), "the sub-parameter survives");
         assert!(!term.has_unhandled_oscs(), "draining must empty the queue");
+    }
+
+    /// **zestful.** The anchor names the row the OSC ARRIVED on, not the row
+    /// the drain happens to find.
+    ///
+    /// This is the whole reason [`UnhandledOsc`] carries a
+    /// [`DispatchAnchor`], and it is written as a DIFFERENCE rather than as a
+    /// value so it cannot pass by coincidence: the mark and the drain are
+    /// asserted to disagree, and the anchor is asserted to be the mark.
+    ///
+    /// Calibrated by construction. The grid is 5 rows and seven lines are
+    /// written after the mark, so the drain-time cursor is provably not where
+    /// the mark was — the second assertion below fails if that setup ever stops
+    /// being true, which would make the third vacuous rather than wrong.
+    /// Recording an anchor at drain time gives `7` here where the truth is `0`;
+    /// the error is the volume of output that followed, so a test whose command
+    /// printed nothing would pass with the defect in place.
+    #[test]
+    fn the_osc_anchor_is_where_the_mark_arrived_not_where_the_drain_finds_the_cursor() {
+        let size = TermSize::new(10, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b]133;A\x07");
+        let at_mark = term.grid.scrolled_off() as i64 + i64::from(term.grid.cursor.point.line.0);
+
+        parser.advance(&mut term, b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\n");
+        let at_drain = term.grid.scrolled_off() as i64 + i64::from(term.grid.cursor.point.line.0);
+
+        let drained = term.take_unhandled_oscs();
+        assert_eq!(drained.len(), 1, "the mark is queued");
+
+        assert_eq!(at_mark, 0, "the mark landed on the first row of a fresh grid");
+        assert_ne!(
+            at_mark, at_drain,
+            "THE CALIBRATION: the output must have moved the cursor, or the \
+             assertion below cannot tell an anchor from a drain-time read"
+        );
+        assert_eq!(
+            drained[0].anchor.absolute_line, at_mark,
+            "the anchor is the row the mark arrived on ({at_mark}), not the row \
+             the drain found ({at_drain})"
+        );
     }
 
     /// An OSC `vte` DOES implement must not also arrive here.
