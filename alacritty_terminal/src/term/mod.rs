@@ -354,6 +354,31 @@ pub enum GraphicsEvent {
     Resize { columns: usize, screen_lines: usize },
 }
 
+/// One OSC that `vte` does not implement, exactly as it arrived.
+///
+/// **zestful addition to upstream alacritty_terminal.** The zestful `vte` fork
+/// hands every OSC it has no arm for to `Handler::osc_unhandled` rather than
+/// logging and dropping it, and this is where those land. `Term` does no
+/// interpretation whatever — it does not know what OSC 7, 9;4, 133 or 777 mean,
+/// exactly as it does not know what the kitty graphics protocol is.
+///
+/// # Why the raw params and not a parsed thing
+///
+/// The embedder decides which OSCs it implements, and that set will grow. A
+/// type that parsed here would have to be extended in this fork every time the
+/// embedder wanted one more, which is the coupling the passthrough exists to
+/// remove. `vte`'s own doc for the hook says the same in the other direction:
+/// implementing one is "a match arm here rather than a second parser in the
+/// embedder's PTY read path".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnhandledOsc {
+    /// The raw semicolon-split sequence, owned. `params[0]` is the OSC number.
+    ///
+    /// Owned because the borrow `vte` passes lives only for the dispatch call,
+    /// and this queue outlives it by design — see [`Term::take_unhandled_oscs`].
+    pub params: Vec<Vec<u8>>,
+}
+
 pub struct Term<T> {
     /// Graphics-relevant events since the last drain, oldest first.
     ///
@@ -364,6 +389,23 @@ pub struct Term<T> {
     /// filled on alacritty's event-loop thread behind a `FairMutex` and read
     /// from another thread — see `take_apc_payloads`.
     graphics_events: Vec<GraphicsEvent>,
+
+    /// Unhandled OSCs since the last drain, oldest first.
+    ///
+    /// **zestful addition to upstream alacritty_terminal**, and a queue for
+    /// [`Self::graphics_events`]'s reason rather than a fresh one: `Term` is
+    /// filled on alacritty's event-loop thread behind a `FairMutex` and read
+    /// from another thread, so a callback would run under that lock on the
+    /// wrong thread. Drained by [`Term::take_unhandled_oscs`].
+    ///
+    /// Separate from `graphics_events` because the two share no ordering
+    /// question. That queue is one queue *because* an APC payload and a screen
+    /// erasure must be ordered against each other or the consumer cannot say
+    /// which image survived the clear. An unhandled OSC is ordered against
+    /// nothing here — the embedder's OSCs are independent of the graphics
+    /// layer's events, and folding them together would put a payload the
+    /// graphics consumer must skip into the queue it drains every frame.
+    unhandled_oscs: Vec<UnhandledOsc>,
 
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
@@ -537,6 +579,7 @@ impl<T> Term<T> {
             colors: color::Colors::default(),
             title_stack: Default::default(),
             graphics_events: Vec::new(),
+            unhandled_oscs: Vec::new(),
             is_focused: Default::default(),
             selection: Default::default(),
             title: Default::default(),
@@ -1180,6 +1223,23 @@ impl<T> Term<T> {
     pub fn has_graphics_events(&self) -> bool {
         !self.graphics_events.is_empty()
     }
+
+    /// Take every unhandled OSC since the last call, in stream order.
+    ///
+    /// **zestful addition to upstream alacritty_terminal.** Draining rather
+    /// than borrowing keeps the `FairMutex` held for the move alone, exactly as
+    /// [`Self::take_graphics_events`] does: the caller takes the lock, swaps
+    /// the queue out, and releases it before deciding what any of it means.
+    #[inline]
+    pub fn take_unhandled_oscs(&mut self) -> Vec<UnhandledOsc> {
+        core::mem::take(&mut self.unhandled_oscs)
+    }
+
+    /// Whether any unhandled OSC is waiting, without taking the queue.
+    #[inline]
+    pub fn has_unhandled_oscs(&self) -> bool {
+        !self.unhandled_oscs.is_empty()
+    }
 }
 
 impl<T: EventListener> Handler for Term<T> {
@@ -1199,6 +1259,26 @@ impl<T: EventListener> Handler for Term<T> {
             display_offset: self.grid.display_offset(),
         };
         self.graphics_events.push(GraphicsEvent::Apc { anchor, payload: bytes.to_vec() });
+    }
+
+    /// **zestful addition.** Queue an OSC `vte` does not implement, for the
+    /// embedder to drain.
+    ///
+    /// Deliberately does no interpretation, for [`Self::apc_dispatch`]'s reason
+    /// stated the other way round: `Term` does not know what OSC 7, 9;4, 133 or
+    /// 777 mean, and the set of OSCs the embedder implements is the embedder's
+    /// to grow. It also captures no anchor — a progress report and a toast are
+    /// about the session rather than about a cell, so unlike an APC payload
+    /// there is no position here that stops existing after this call.
+    ///
+    /// **Every unhandled OSC is queued, including ones `vte` will implement
+    /// later.** The alternative — filtering to a known set here — would put the
+    /// embedder's vocabulary in this fork and need a change here every time
+    /// that vocabulary grew.
+    #[inline]
+    fn osc_unhandled(&mut self, params: &[&[u8]]) {
+        self.unhandled_oscs
+            .push(UnhandledOsc { params: params.iter().map(|p| p.to_vec()).collect() });
     }
 
     /// A character to be displayed.
@@ -3519,6 +3599,125 @@ mod tests {
         let drained = term.take_graphics_events();
         assert_eq!(apc_only(&drained), vec![b"Gf=100,a=T,i=1;iVBORw0KGgo=".to_vec()]);
         assert!(!term.has_graphics_events(), "draining must empty the queue");
+    }
+
+    /// Pull the OSC numbers out of a drained unhandled-OSC queue.
+    fn osc_numbers(oscs: &[UnhandledOsc]) -> Vec<Vec<u8>> {
+        oscs.iter().map(|o| o.params[0].clone()).collect()
+    }
+
+    /// **zestful.** An OSC `vte` does not implement must survive the whole
+    /// path: `Processor::advance` -> the forked vte parser -> `osc_dispatch`'s
+    /// passthrough -> `Handler::osc_unhandled` -> `Term`'s queue.
+    ///
+    /// This is `apc_payload_reaches_term_through_the_parser`'s twin, and it
+    /// exists for the reason that one does: the fork's own test suite pins the
+    /// parser handing a payload to a LOCAL test `Handler`, which says nothing
+    /// about `Term` — the only implementor that ships. Before this, an OSC 133
+    /// reached vte, was forwarded, and died in `Handler::osc_unhandled`'s
+    /// defaulted empty body, and no test in either repository could see it.
+    ///
+    /// The empty assertion first is a calibration and it is sound by
+    /// CONSTRUCTION rather than by observation: this `Term` was made two lines
+    /// above and nothing has been advanced into it, so there is no thread and
+    /// no earlier write that could have filled the queue.
+    #[test]
+    fn an_unhandled_osc_reaches_term_through_the_parser() {
+        let size = TermSize::new(10, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        assert!(!term.has_unhandled_oscs());
+        parser.advance(&mut term, b"\x1b]133;A\x07");
+
+        assert!(term.has_unhandled_oscs());
+        let drained = term.take_unhandled_oscs();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].params[0], b"133".to_vec());
+        assert_eq!(drained[0].params[1], b"A".to_vec(), "the sub-parameter survives");
+        assert!(!term.has_unhandled_oscs(), "draining must empty the queue");
+    }
+
+    /// An OSC `vte` DOES implement must not also arrive here.
+    ///
+    /// **The control for the test above**, and it is not decoration: a
+    /// passthrough that forwarded everything would satisfy that test and would
+    /// duplicate every title, colour query and clipboard write into a queue the
+    /// embedder then has to filter. vte pins this at its own layer; what this
+    /// adds is that the two paths stay separate at `Term`, which is where both
+    /// arrive.
+    ///
+    /// # What can and cannot make this fail, said plainly
+    ///
+    /// **No change in this crate can.** Deleting `osc_unhandled` below leaves
+    /// this green, correctly — it asserts an absence, and the absence is more
+    /// true with no override than with one. It is calibrated by the OTHER
+    /// direction: what fails it is a `vte` repin that widened the passthrough
+    /// to forward OSCs vte implements. That is the regression it exists for,
+    /// and it is a real one — the pin moves and this crate does not.
+    ///
+    /// So do not read its green as evidence about the queue. The three tests
+    /// around it are what carry that, and all three go red when the override is
+    /// removed.
+    #[test]
+    fn a_handled_osc_does_not_also_reach_the_queue() {
+        let size = TermSize::new(10, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b]0;a title\x07");
+
+        assert_eq!(term.title, Some("a title".to_owned()), "calibrate: OSC 0 was handled");
+        assert!(!term.has_unhandled_oscs(), "OSC 0 is vte's own; it must not also pass through");
+    }
+
+    /// Several unhandled OSCs arrive in stream order, and text between them is
+    /// unaffected.
+    ///
+    /// Order is the property the embedder cannot recover for itself. It matters
+    /// most for the one this seam retires: OSC 133's marks are `A`, `B`, `C`,
+    /// `D` per prompt and mean nothing shuffled.
+    #[test]
+    fn unhandled_oscs_queue_in_stream_order_around_text() {
+        let size = TermSize::new(10, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b]133;A\x07AB\x1b]9;4;1;42\x07CD\x1b]777;notify;t;b\x07");
+
+        let drained = term.take_unhandled_oscs();
+        assert_eq!(
+            osc_numbers(&drained),
+            vec![b"133".to_vec(), b"9".to_vec(), b"777".to_vec()],
+            "three unhandled OSCs, in the order they arrived"
+        );
+        // The 9;4 progress report keeps every field, which is what makes a
+        // match arm upstack possible at all.
+        assert_eq!(
+            drained[1].params,
+            vec![b"9".to_vec(), b"4".to_vec(), b"1".to_vec(), b"42".to_vec()]
+        );
+
+        let row: String = (0..4).map(|c| term.grid[Line(0)][Column(c)].c).collect();
+        assert_eq!(row, "ABCD", "the OSCs are consumed by the parser, not printed");
+    }
+
+    /// A `ESC \` (ST) terminator reaches the queue exactly as `BEL` does.
+    ///
+    /// Both spellings are legal and shells differ. `osc133.rs`, the hand-rolled
+    /// scanner this seam exists to retire, needed eight states to get this
+    /// right; here it is the parser's problem and already solved.
+    #[test]
+    fn an_st_terminated_unhandled_osc_arrives_too() {
+        let size = TermSize::new(10, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b]133;D;0\x1b\\");
+
+        let drained = term.take_unhandled_oscs();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].params, vec![b"133".to_vec(), b"D".to_vec(), b"0".to_vec()]);
     }
 
     /// Text around a graphics command must still land on the grid: the APC is
