@@ -3705,9 +3705,22 @@ mod tests {
     /// written after the mark, so the drain-time cursor is provably not where
     /// the mark was — the second assertion below fails if that setup ever stops
     /// being true, which would make the third vacuous rather than wrong.
-    /// Recording an anchor at drain time gives `7` here where the truth is `0`;
-    /// the error is the volume of output that followed, so a test whose command
-    /// printed nothing would pass with the defect in place.
+    /// Recording an anchor at drain time gives `7` here where the truth is `0`.
+    ///
+    /// # THE SEVEN LINES ARE THE TEST. DO NOT TRIM THEM AS SETUP.
+    ///
+    /// This defect's error is the VOLUME OF OUTPUT THAT FOLLOWED THE MARK, so
+    /// on the obvious fixture — a mark on a fresh grid with nothing after it —
+    /// the right and wrong answers are both `0` and the test passes with the
+    /// bug fully present. That is why it survived: not because anyone aimed a
+    /// test wrong, but because **the natural input makes the two answers
+    /// coincide**. You write `echo hi`; you do not write "seven lines, then
+    /// read the mark".
+    ///
+    /// So the fixture is chosen to separate them, and shortening it here would
+    /// restore the blind spot with nothing going red. When testing a POSITIONAL
+    /// or ACCUMULATING quantity, ask what makes the right and wrong answers
+    /// DIFFER, and put that in the fixture.
     #[test]
     fn the_osc_anchor_is_where_the_mark_arrived_not_where_the_drain_finds_the_cursor() {
         let size = TermSize::new(10, 5);
