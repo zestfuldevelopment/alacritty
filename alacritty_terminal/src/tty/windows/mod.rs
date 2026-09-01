@@ -111,7 +111,7 @@ impl EventedReadWrite for Pty {
 
 impl EventedPty for Pty {
     fn next_child_event(&mut self) -> Option<ChildEvent> {
-        match self.child_watcher.event_rx().try_recv() {
+        match self.child_watcher.next_event() {
             Ok(ev) => Some(ev),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => Some(ChildEvent::Exited(None)),

@@ -52,6 +52,7 @@ extern "system" fn child_exit_callback(ctx: *mut c_void, timed_out: BOOLEAN) {
 pub struct ChildExitWatcher {
     wait_handle: AtomicPtr<c_void>,
     event_rx: mpsc::Receiver<ChildEvent>,
+    pending_event: Mutex<Option<ChildEvent>>,
     interest: Arc<Mutex<Option<Interest>>>,
     child_handle: AtomicPtr<c_void>,
     pid: Option<NonZeroU32>,
@@ -86,6 +87,7 @@ impl ChildExitWatcher {
             let pid = unsafe { NonZeroU32::new(GetProcessId(child_handle)) };
             Ok(ChildExitWatcher {
                 event_rx,
+                pending_event: Mutex::new(None),
                 interest,
                 pid,
                 child_handle: AtomicPtr::from(child_handle),
@@ -100,6 +102,20 @@ impl ChildExitWatcher {
 
     pub fn register(&self, poller: &Arc<Poller>, event: Event) {
         *self.interest.lock().unwrap() = Some(Interest { poller: poller.clone(), event });
+
+        if let Ok(child_event) = self.event_rx.try_recv() {
+            *self.pending_event.lock().unwrap() = Some(child_event);
+            poller.post(CompletionPacket::new(event)).ok();
+        }
+    }
+
+    pub fn next_event(&self) -> Result<ChildEvent, mpsc::TryRecvError> {
+        self.pending_event
+            .lock()
+            .unwrap()
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| self.event_rx.try_recv())
     }
 
     pub fn deregister(&self) {
@@ -164,5 +180,29 @@ mod tests {
             child_exit_watcher.event_rx().try_recv(),
             Ok(ChildEvent::Exited(Some(expected_status)))
         );
+    }
+
+    #[test]
+    pub fn register_notifies_when_exit_precedes_interest() {
+        const WAIT_TIMEOUT: Duration = Duration::from_millis(200);
+
+        let (event_tx, event_rx) = mpsc::channel();
+        event_tx.send(ChildEvent::Exited(Some(ExitStatus::from_raw(7)))).unwrap();
+        let watcher = ChildExitWatcher {
+            wait_handle: AtomicPtr::new(ptr::null_mut()),
+            event_rx,
+            pending_event: Mutex::new(None),
+            interest: Arc::new(Mutex::new(None)),
+            child_handle: AtomicPtr::new(ptr::null_mut()),
+            pid: None,
+        };
+        let poller = Arc::new(Poller::new().unwrap());
+
+        watcher.register(&poller, Event::readable(PTY_CHILD_EVENT_TOKEN));
+
+        let mut events = polling::Events::new();
+        assert_eq!(poller.wait(&mut events, Some(WAIT_TIMEOUT)).unwrap(), 1);
+        assert_eq!(events.iter().next().unwrap().key, PTY_CHILD_EVENT_TOKEN);
+        assert_eq!(watcher.next_event(), Ok(ChildEvent::Exited(Some(ExitStatus::from_raw(7)))));
     }
 }
