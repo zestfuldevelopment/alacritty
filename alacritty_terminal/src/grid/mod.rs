@@ -126,6 +126,27 @@ pub struct Grid<T> {
     /// Number of visible lines.
     lines: usize,
 
+    /// Whether growing the viewport leaves the scrollback alone.
+    ///
+    /// **zestful addition.** Upstream lifts rows out of history into the active
+    /// area on grow, so that the cursor stays at the bottom. That is right when
+    /// the pty merely SIGNALS a resize, and wrong when the pty REPAINTS its
+    /// whole viewport on one: ConPTY does, so the child redraws the active area
+    /// over every lifted row, and those rows are then gone from the history as
+    /// well. Measured on Windows: one shrink-and-grow destroyed exactly
+    /// `lines_added` lines of scrollback, and four cycles emptied a 60-line
+    /// buffer to nothing.
+    ///
+    /// **Off by default**, so upstream's behaviour -- and its two `grow_lines`
+    /// cursor tests -- are untouched. The embedder turns it on for the ptys
+    /// that repaint, which today means ConPTY and nothing else.
+    ///
+    /// Skipped for serde, as the cursors are: this is configuration the
+    /// embedder sets rather than grid state, and the ref tests compare recorded
+    /// grids that predate the field.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub grow_keeps_history: bool,
+
     /// Offset of displayed area.
     ///
     /// If the displayed region isn't at the bottom of the screen, it stays
@@ -166,6 +187,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             max_scroll_limit,
             display_offset: 0,
             scrolled_off: 0,
+            grow_keeps_history: false,
             saved_cursor: Cursor::default(),
             cursor: Cursor::default(),
             lines,

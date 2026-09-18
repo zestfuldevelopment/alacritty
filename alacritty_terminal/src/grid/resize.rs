@@ -51,8 +51,13 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         self.raw.grow_visible_lines(target);
         self.lines = target;
 
+        // Rows lifted out of the history so that the cursor stays at the
+        // bottom -- none of them when the pty repaints its own viewport on a
+        // resize, because the child then owns the active area and draws over
+        // whatever was lifted into it. See `Grid::grow_keeps_history`.
         let history_size = self.history_size();
-        let from_history = min(history_size, lines_added);
+        let from_history =
+            if self.grow_keeps_history { 0 } else { min(history_size, lines_added) };
 
         // Move existing lines up for every line that couldn't be pulled from history.
         if from_history != lines_added {

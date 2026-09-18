@@ -536,6 +536,12 @@ pub struct Config {
 
     /// OSC52 support mode.
     pub osc52: Osc52,
+
+    /// Whether growing the viewport leaves the scrollback alone.
+    ///
+    /// **zestful addition.** `false` is upstream's behaviour; see
+    /// `Grid::grow_keeps_history` for what turning it on is for.
+    pub grow_keeps_history: bool,
 }
 
 impl Default for Config {
@@ -547,6 +553,7 @@ impl Default for Config {
             vi_mode_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
+            grow_keeps_history: false,
         }
     }
 }
@@ -597,8 +604,12 @@ impl<T> Term<T> {
         let num_lines = dimensions.screen_lines();
 
         let history_size = config.scrolling_history;
-        let grid = Grid::new(num_lines, num_cols, history_size);
-        let inactive_grid = Grid::new(num_lines, num_cols, 0);
+        let mut grid = Grid::new(num_lines, num_cols, history_size);
+        let mut inactive_grid = Grid::new(num_lines, num_cols, 0);
+        // Both grids: the alternate screen is swapped in by value, so a flag
+        // set on only one would change behaviour with the screen.
+        grid.grow_keeps_history = config.grow_keeps_history;
+        inactive_grid.grow_keeps_history = config.grow_keeps_history;
 
         let tabs = TabStops::new(grid.columns());
 
