@@ -97,6 +97,23 @@ two already:
   to a *plausible* wrong row. Never reusing a value means it resolves far
   outside the grid instead, where it is obviously invalid.
 
+## Handed-off consoles (Windows)
+
+`tty::windows::from_handoff(Handoff, WindowSize) -> Pty`, in the new
+`tty/windows/handoff.rs`, wraps a console session that another console host
+started and handed to the embedder through Windows' default-terminal handoff
+(`ITerminalHandoff3::EstablishPtyHandoff`). The child is already running, so
+there is no `HPCON`. What there is instead are the handles an `HPCON` wraps
+(signal pipe, reference, console host process). `HandedOff` resizes by writing
+the 6-byte packet `winconpty.cpp`'s `_ResizePseudoConsole` writes, and closes by
+dropping them, as `ClosePseudoConsole` does without its wait. So no
+`conpty.dll` is needed.
+
+The one upstream line changed: `use conpty::Conpty as Backend` became a
+two-variant `enum Backend` with `From` impls, so `Pty::new` and every existing
+call site are untouched. A rebase conflicts only if upstream edits that `use`
+or `Pty`'s backend field. One test pins the resize packet byte for byte.
+
 ## Why this fork exists at all
 
 The plan originally expected `alacritty_terminal` to need **no** changes — the

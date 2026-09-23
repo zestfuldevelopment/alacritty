@@ -12,9 +12,13 @@ use crate::tty::{ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 mod blocking;
 mod child;
 mod conpty;
+mod handoff;
+
+pub use handoff::{Handoff, from_handoff};
 
 use blocking::{UnblockedReader, UnblockedWriter};
-use conpty::Conpty as Backend;
+use conpty::Conpty;
+use handoff::HandedOff;
 use miow::pipe::{AnonRead, AnonWrite};
 use polling::{Event, Poller};
 
@@ -31,6 +35,34 @@ pub struct Pty {
     conout: ReadPipe,
     conin: WritePipe,
     child_watcher: ChildExitWatcher,
+}
+
+/// A pseudoconsole this process created, or one another console host handed
+/// to it (zestful addition; see `handoff`).
+enum Backend {
+    Conpty(Conpty),
+    HandedOff(HandedOff),
+}
+
+impl From<Conpty> for Backend {
+    fn from(conpty: Conpty) -> Self {
+        Self::Conpty(conpty)
+    }
+}
+
+impl From<HandedOff> for Backend {
+    fn from(handed_off: HandedOff) -> Self {
+        Self::HandedOff(handed_off)
+    }
+}
+
+impl OnResize for Backend {
+    fn on_resize(&mut self, window_size: WindowSize) {
+        match self {
+            Self::Conpty(conpty) => conpty.on_resize(window_size),
+            Self::HandedOff(handed_off) => handed_off.on_resize(window_size),
+        }
+    }
 }
 
 pub fn new(config: &Options, window_size: WindowSize, _window_id: u64) -> Result<Pty> {
