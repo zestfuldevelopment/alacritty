@@ -215,6 +215,12 @@ pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd
     let mut builder = if let Some(shell) = config.shell.as_ref() {
         let mut cmd = Command::new(&shell.program);
         cmd.args(shell.args.as_slice());
+        // zestful addition: a dashed `argv[0]` is the only portable way to ask
+        // for a login shell, and the embedder cannot reach this `Command` --
+        // it is built here and never handed out. See `Shell::arg0`.
+        if let Some(arg0) = shell.arg0.as_deref() {
+            cmd.arg0(arg0);
+        }
         cmd
     } else {
         default_shell_command(&user.shell, &user.user, &user.home)
@@ -445,4 +451,57 @@ unsafe fn set_nonblocking(fd: c_int) {
 fn test_get_pw_entry() {
     let mut buf: [i8; 1024] = [0; 1024];
     let _pw = get_pw_entry(&mut buf).unwrap();
+}
+
+/// zestful addition: `Shell::with_arg0` reaches the child's `argv[0]`.
+///
+/// The property is observable only from the child, so the child is the oracle:
+/// `sh -c 'printf %s "$0"'` prints its own `argv[0]` and nothing else. A
+/// dashed one is what the traditional login-shell convention asks for, and it
+/// is the case that matters -- `Shell::new` leaves `arg0` `None` and the
+/// program path arrives instead, which the second half asserts so that a
+/// `with_arg0` that quietly did nothing cannot pass.
+#[test]
+fn arg0_reaches_the_child() {
+    use std::io::Read as _;
+
+    use crate::tty::Shell;
+
+    fn argv0_of(shell: Shell) -> String {
+        let options = Options { shell: Some(shell), ..Default::default() };
+        let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+        let mut pty = new(&options, size, 0).expect("pty");
+        // The master is O_NONBLOCK (see `new`), so a single read returns
+        // before the child has been scheduled. Poll until bytes arrive or the
+        // budget runs out -- the child prints a few bytes and exits, so this
+        // settles in one or two ticks and the budget is only there to fail
+        // rather than hang.
+        let mut out = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while out.is_empty() && std::time::Instant::now() < deadline {
+            let mut buf = [0u8; 256];
+            match pty.reader().read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        out
+    }
+
+    let dashed = argv0_of(Shell::with_arg0(
+        "/bin/sh".into(),
+        vec!["-c".into(), "printf %s \"$0\"".into()],
+        Some("-sh".into()),
+    ));
+    assert!(dashed.contains("-sh"), "argv[0] should be `-sh`, child said: {dashed:?}");
+
+    let plain = argv0_of(Shell::new(
+        "/bin/sh".into(),
+        vec!["-c".into(), "printf %s \"$0\"".into()],
+    ));
+    assert!(
+        plain.contains("/bin/sh"),
+        "without arg0 the program path should arrive, child said: {plain:?}"
+    );
 }

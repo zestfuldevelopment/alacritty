@@ -50,11 +50,33 @@ pub struct Shell {
     pub(crate) program: String,
     /// Arguments passed to shell.
     pub(crate) args: Vec<String>,
+    /// `argv[0]` for the child, when it must differ from `program`
+    /// (zestful addition).
+    ///
+    /// The traditional way to ask for a **login shell** is a dashed `argv[0]`
+    /// -- `-zsh` rather than `zsh`. A login *flag* is not portable: `-l` is
+    /// absent from some login shells altogether, so the convention is the only
+    /// mechanism that works everywhere.
+    ///
+    /// `None` leaves `argv[0]` as the program path, which is what every
+    /// upstream caller gets and what `Shell::new` produces.
+    ///
+    /// **Unix only in effect.** Windows has no `argv[0]` convention -- a
+    /// process receives one command line and parses it itself -- so the field
+    /// is carried there and ignored, rather than being `cfg`'d out and making
+    /// `Shell` a different type per platform for an embedder to handle.
+    pub(crate) arg0: Option<String>,
 }
 
 impl Shell {
     pub fn new(program: String, args: Vec<String>) -> Self {
-        Self { program, args }
+        Self { program, args, arg0: None }
+    }
+
+    /// A shell whose `argv[0]` is `arg0` rather than its program path
+    /// (zestful addition). See [`Shell::arg0`].
+    pub fn with_arg0(program: String, args: Vec<String>, arg0: Option<String>) -> Self {
+        Self { program, args, arg0 }
     }
 }
 

@@ -9,13 +9,64 @@ Upstream `alacritty/alacritty`, tag **`alacritty_terminal_v0.26.0`** (`94e7c88`)
 crates.io `alacritty_terminal-0.26.0` source is empty. The fork base is
 byte-identical to what the workspace was already building.
 
-Our work is on branch **`zestful/apc-queue`**, pinned **by rev** in
-`[patch.crates-io]`, never by branch.
+Pinned **by rev** in `[patch.crates-io]`, never by branch.
+
+**This file said the delta was one file until 2026-10-13.** It is seven.
+`term/mod.rs` is the largest piece and was the first, and the sentence was
+never updated as the others landed. Nothing checks prose against a pin.
+
+The branch claim was right and is kept: `zestful/apc-queue` is the integration
+branch and contains every pinned revision. (An earlier draft of this correction
+said otherwise, on the strength of an ancestry test run backwards --
+`apc-queue` contains the pin, not the other way round.)
 
 ## Delta
 
-One file, `alacritty_terminal/src/term/mod.rs`, plus a `[patch.crates-io]` entry
-in the workspace `Cargo.toml` pointing at the zestful `vte` fork.
+Measured against the base tag at the pinned rev, not recalled:
+`alacritty_terminal/src/` differs in seven files. Plus a `[patch.crates-io]`
+entry in the workspace `Cargo.toml` pointing at the zestful `vte` fork.
+
+The APC queue below is the largest piece and the reason the fork exists. The
+rest, in the order they landed:
+
+- **Primary DA answered with a parameter**, so real clients accept it.
+- **Unhandled OSCs queued** for the embedder to drain, anchored at dispatch.
+- **Growing the viewport leaves the scrollback alone.**
+- **A child exit that arrived before anyone registered interest** is still
+  delivered.
+- **Windows console handoff** (`tty/windows/handoff.rs`): wrap a console
+  session another host handed over.
+- **`Shell::arg0`** — see below.
+
+### `Shell::arg0` (2026-10-13)
+
+`Shell` gains `arg0: Option<String>` and a `Shell::with_arg0` constructor;
+`tty::unix::from_fd` calls `CommandExt::arg0` with it when it is `Some`.
+
+**Why it cannot be done by the embedder.** A **login shell** is asked for by
+the traditional dashed `argv[0]` convention -- `-zsh`, not `zsh` -- because a
+login *flag* is not portable: some login shells have no `-l` at all. Upstream
+`Shell`'s fields are `pub(crate)`, and `from_fd` builds the `Command`
+internally and never hands it out, so `CommandExt::arg0` has nowhere to be
+called from outside this crate. zestful-terminal shipped a `/bin/bash
+--noprofile --norc -c "exec -a -<name> <shell>"` trampoline as the interim, and
+this delta is what retires it (zestful-terminal#325).
+
+**Windows carries the field and ignores it**, rather than being `cfg`'d out:
+there is no `argv[0]` convention there -- a process receives one command line
+and parses it itself -- and a `Shell` that is a different type per platform is
+worse for an embedder than a field that is documented as unix-only in effect.
+
+Pinned by `tty::unix::arg0_reaches_the_child`, which asks the child rather than
+the API: `sh -c 'printf %s "$0"'` prints its own `argv[0]`. Its second half is
+the control -- `Shell::new` must still deliver the program path -- so a
+`with_arg0` that did nothing cannot pass.
+
+**Upstream was not asked.** zestful-terminal#325 says "upstream first and fork
+if refused"; that order was deliberately skipped (John, 2026-10-13) because the
+fork already exists and already carries six other deltas. No upstream issue or
+PR for `arg0` exists as of 2026-10-13 -- searched, not assumed -- so nothing is
+pending and nothing retires this one.
 
 - `pub struct ApcAnchor { point, absolute_line, display_offset }` — where an APC
   arrived in the grid.
