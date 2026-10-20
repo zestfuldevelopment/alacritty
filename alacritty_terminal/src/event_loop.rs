@@ -21,7 +21,12 @@ use crate::{thread, tty};
 use vte::ansi;
 
 /// Max bytes to read from the PTY before forced terminal synchronization.
-pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
+///
+/// Also the size of the reader thread's stack buffer and of both ConPTY pipe
+/// rings, all committed when a pane opens. 64 KiB matches `MAX_LOCKED_READ`;
+/// at 1 MiB they cost about 3 MiB per pane, which a terminal hosting thousands
+/// of panes cannot afford.
+pub(crate) const READ_BUFFER_SIZE: usize = 0x1_0000;
 
 /// Max bytes to read from the PTY while the terminal is locked.
 const MAX_LOCKED_READ: usize = u16::MAX as usize;
