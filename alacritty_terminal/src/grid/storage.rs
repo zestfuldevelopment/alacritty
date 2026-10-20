@@ -1,4 +1,4 @@
-use std::cmp::max;
+use std::cmp::{max, min};
 use std::mem;
 use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut};
@@ -130,7 +130,12 @@ impl<T> Storage<T> {
         if self.len + additional_rows > self.inner.len() {
             self.rezero();
 
-            let realloc_size = self.inner.len() + max(additional_rows, MAX_CACHE_SIZE);
+            // Grow by what is already held, up to MAX_CACHE_SIZE rows at a time. Every
+            // pane scrolls a line into history sooner or later, and a fixed
+            // MAX_CACHE_SIZE step made that first line cost a thousand full rows
+            // (about 2 MiB at 80 columns) in a pane that may never use them.
+            let step = min(MAX_CACHE_SIZE, self.inner.len().max(1));
+            let realloc_size = self.inner.len() + max(additional_rows, step);
             self.inner.resize_with(realloc_size, || Row::new(columns));
         }
 
@@ -267,7 +272,7 @@ impl<T> IndexMut<Line> for Storage<T> {
 mod tests {
     use crate::grid::GridCell;
     use crate::grid::row::Row;
-    use crate::grid::storage::{MAX_CACHE_SIZE, Storage};
+    use crate::grid::storage::Storage;
     use crate::index::{Column, Line};
     use crate::term::cell::Flags;
 
@@ -344,8 +349,8 @@ mod tests {
     ///   1: 1
     ///   2: -
     ///   3: \0
-    ///   ...
-    ///   MAX_CACHE_SIZE: \0
+    ///   4: \0
+    ///   5: \0
     #[test]
     fn grow_after_zero() {
         // Setup storage area.
@@ -366,7 +371,8 @@ mod tests {
             visible_lines: 4,
             len: 4,
         };
-        expected.inner.append(&mut vec![filled_row('\0'); MAX_CACHE_SIZE]);
+        // A three-row buffer grows by three rows, not by MAX_CACHE_SIZE.
+        expected.inner.append(&mut vec![filled_row('\0'); 3]);
 
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -385,8 +391,8 @@ mod tests {
     ///   1: 1
     ///   2: -
     ///   3: \0
-    ///   ...
-    ///   MAX_CACHE_SIZE: \0
+    ///   4: \0
+    ///   5: \0
     #[test]
     fn grow_before_zero() {
         // Setup storage area.
@@ -407,7 +413,8 @@ mod tests {
             visible_lines: 4,
             len: 4,
         };
-        expected.inner.append(&mut vec![filled_row('\0'); MAX_CACHE_SIZE]);
+        // A three-row buffer grows by three rows, not by MAX_CACHE_SIZE.
+        expected.inner.append(&mut vec![filled_row('\0'); 3]);
 
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -738,7 +745,7 @@ mod tests {
             filled_row('4'),
             filled_row('5'),
         ];
-        let expected_init_size = std::cmp::max(init_size, MAX_CACHE_SIZE);
+        let expected_init_size = std::cmp::max(init_size, 6);
         expected_inner.append(&mut vec![filled_row('\0'); expected_init_size]);
         let expected_storage = Storage { inner: expected_inner, zero: 0, visible_lines: 0, len: 9 };
 
