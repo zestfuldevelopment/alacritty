@@ -143,21 +143,33 @@ pub struct UnblockedWriter<W> {
     /// The pipe that we are writing to.
     pipe: Writer,
 
-    /// We logically own the writer, but we don't actually use it.
-    _reader: PhantomData<W>,
+    /// The sink and the pipe's draining end, until the first write starts the
+    /// thread that owns them.
+    ///
+    /// A pane that is never written to never needs that thread, and a terminal
+    /// hosting thousands of mostly idle panes pays for every one it starts.
+    /// Bytes written before the thread runs wait in the pipe, so starting it
+    /// late loses and reorders nothing.
+    idle: Option<(W, Reader)>,
 }
 
 impl<W: Write + Send + 'static> UnblockedWriter<W> {
-    /// Spawn a new unblocked writer.
-    pub fn new(mut sink: W, pipe_capacity: usize) -> Self {
+    /// Create a new unblocked writer; its thread starts on the first write.
+    pub fn new(sink: W, pipe_capacity: usize) -> Self {
         // Create a new pipe.
-        let (mut reader, writer) = pipe(pipe_capacity);
+        let (reader, writer) = pipe(pipe_capacity);
         let interest = Arc::new(Registration {
             interest: Mutex::<Option<Interest>>::new(None),
             end: PipeEnd::Writer,
         });
 
-        // Spawn the writer thread.
+        Self { interest, pipe: writer, idle: Some((sink, reader)) }
+    }
+
+    /// Spawn the writer thread, if it is not already running.
+    fn start(&mut self) {
+        let Some((mut sink, mut reader)) = self.idle.take() else { return };
+
         spawn_named("alacritty-tty-writer-thread", move || {
             let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
             let mut context = Context::from_waker(&waker);
@@ -194,8 +206,6 @@ impl<W: Write + Send + 'static> UnblockedWriter<W> {
                 }
             }
         });
-
-        Self { interest, pipe: writer, _reader: PhantomData }
     }
 
     /// Register interest in the writer.
@@ -217,6 +227,10 @@ impl<W: Write + Send + 'static> UnblockedWriter<W> {
 
     /// Try to write to the writer.
     pub fn try_write(&mut self, buf: &[u8]) -> usize {
+        if !buf.is_empty() {
+            self.start();
+        }
+
         let waker = Waker::from(self.interest.clone());
 
         match self.pipe.poll_fill_bytes(&mut Context::from_waker(&waker), buf) {
