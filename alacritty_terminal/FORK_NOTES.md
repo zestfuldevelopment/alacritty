@@ -37,6 +37,10 @@ rest, in the order they landed:
 - **Windows console handoff** (`tty/windows/handoff.rs`): wrap a console
   session another host handed over.
 - **`Shell::arg0`** — see below.
+- **CSI 16 t answered**: `Handler::cell_size_pixels` on `Term` sends the same
+  `Event::TextAreaSizeRequest` as 14 t with a formatter for
+  `CSI 6 ; cell_height ; cell_width t`, so a host that answers one answers both.
+  Needs the `vte` fork at a rev that dispatches 16 (2026-10-24).
 
 ### `Shell::arg0` (2026-10-13)
 
@@ -203,7 +207,9 @@ fairness — to save a 5-line delta. Rejected.
 
 ## Tests
 
-Ten added in `term::tests`, covering the whole path `Processor::advance` →
+Eleven added in `term::tests`. One, `cell_size_pixels_is_reported_beside_the_text_area`,
+records what the 16 t and 14 t formatters write for one fixed `WindowSize`
+and pins the two reports. The ten APC tests cover the whole path `Processor::advance` →
 forked `vte` → `Handler::apc_dispatch` → `Term`'s queue: payload delivery and
 drain semantics, text around an APC landing on the grid undisturbed, `m=1`
 chunked payloads queueing in order, per-image anchoring with two images in one

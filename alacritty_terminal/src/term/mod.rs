@@ -2597,6 +2597,18 @@ impl<T: EventListener> Handler for Term<T> {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
         self.event_proxy.send_event(Event::PtyWrite(text));
     }
+
+    /// XTWINOPS 16: one cell's size in pixels, `CSI 6 ; height ; width t`.
+    ///
+    /// The same event as 14's, with a different formatter: the event carries
+    /// the report to make from the host's `WindowSize`, so a host that answers
+    /// `TextAreaSizeRequest` answers this with no change (zestful addition).
+    #[inline]
+    fn cell_size_pixels(&mut self) {
+        self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
+            format!("\x1b[6;{};{}t", window_size.cell_height, window_size.cell_width)
+        })));
+    }
 }
 
 /// The state of the [`Mode`] and [`PrivateMode`].
@@ -2845,6 +2857,40 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    /// Records what each size request would write for one fixed window.
+    struct SizeRecorder(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+    impl EventListener for SizeRecorder {
+        fn send_event(&self, event: Event) {
+            if let Event::TextAreaSizeRequest(format) = event {
+                let size = crate::event::WindowSize {
+                    num_lines: 3,
+                    num_cols: 10,
+                    cell_width: 8,
+                    cell_height: 16,
+                };
+                self.0.borrow_mut().push(format(size));
+            }
+        }
+    }
+
+    /// CSI 16 t is answered with the cell, CSI 14 t with the text area, and the
+    /// two reports differ in their leading parameter (zestful addition).
+    #[test]
+    fn cell_size_pixels_is_reported_beside_the_text_area() {
+        let answers = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, SizeRecorder(answers.clone()));
+
+        term.cell_size_pixels();
+        term.text_area_size_pixels();
+
+        assert_eq!(
+            *answers.borrow(),
+            vec!["\x1b[6;16;8t".to_string(), "\x1b[4;48;80t".to_string()]
+        );
+    }
 
     #[test]
     fn scroll_display_page_up() {
