@@ -257,6 +257,7 @@ mod test {
             shell: Some(Shell {
                 program: "echo".to_string(),
                 args: vec!["hello world".to_string()],
+                arg0: None,
             }),
             working_directory: None,
             drain_on_exit: true,
