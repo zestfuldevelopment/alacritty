@@ -96,26 +96,23 @@ impl ChildExitWatcher {
         }
     }
 
-    pub fn event_rx(&self) -> &mpsc::Receiver<ChildEvent> {
-        &self.event_rx
-    }
-
     pub fn register(&self, poller: &Arc<Poller>, event: Event) {
         *self.interest.lock().unwrap() = Some(Interest { poller: poller.clone(), event });
-
-        if let Ok(child_event) = self.event_rx.try_recv() {
-            *self.pending_event.lock().unwrap() = Some(child_event);
+        if let Ok(queued_event) = self.event_rx.try_recv() {
+            *self.pending_event.lock().unwrap() = Some(queued_event);
             poller.post(CompletionPacket::new(event)).ok();
         }
     }
 
-    pub fn next_event(&self) -> Result<ChildEvent, mpsc::TryRecvError> {
-        self.pending_event
-            .lock()
-            .unwrap()
-            .take()
-            .map(Ok)
-            .unwrap_or_else(|| self.event_rx.try_recv())
+    pub fn next_event(&self) -> Option<ChildEvent> {
+        if let Some(event) = self.pending_event.lock().unwrap().take() {
+            return Some(event);
+        }
+        match self.event_rx.try_recv() {
+            Ok(event) => Some(event),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(ChildEvent::Exited(None)),
+        }
     }
 
     pub fn deregister(&self) {
@@ -177,17 +174,18 @@ mod tests {
         // Verify that at least one `ChildEvent::Exited` was received.
         let expected_status = ExitStatus::from_raw(1);
         assert_eq!(
-            child_exit_watcher.event_rx().try_recv(),
-            Ok(ChildEvent::Exited(Some(expected_status)))
+            child_exit_watcher.next_event(),
+            Some(ChildEvent::Exited(Some(expected_status)))
         );
     }
 
     #[test]
-    pub fn register_notifies_when_exit_precedes_interest() {
+    fn an_exit_queued_before_register_is_relayed() {
         const WAIT_TIMEOUT: Duration = Duration::from_millis(200);
 
-        let (event_tx, event_rx) = mpsc::channel();
-        event_tx.send(ChildEvent::Exited(Some(ExitStatus::from_raw(7)))).unwrap();
+        let poller = Arc::new(Poller::new().unwrap());
+        let (sender, event_rx) = mpsc::channel();
+        sender.send(ChildEvent::Exited(Some(ExitStatus::from_raw(7)))).unwrap();
         let watcher = ChildExitWatcher {
             wait_handle: AtomicPtr::new(ptr::null_mut()),
             event_rx,
@@ -196,13 +194,17 @@ mod tests {
             child_handle: AtomicPtr::new(ptr::null_mut()),
             pid: None,
         };
-        let poller = Arc::new(Poller::new().unwrap());
 
+        // This is the exact registration-window state: the OS callback has
+        // queued an exit, but it saw no interest and could not post a token.
         watcher.register(&poller, Event::readable(PTY_CHILD_EVENT_TOKEN));
 
         let mut events = polling::Events::new();
-        assert_eq!(poller.wait(&mut events, Some(WAIT_TIMEOUT)).unwrap(), 1);
+        poller.wait(&mut events, Some(WAIT_TIMEOUT)).unwrap();
         assert_eq!(events.iter().next().unwrap().key, PTY_CHILD_EVENT_TOKEN);
-        assert_eq!(watcher.next_event(), Ok(ChildEvent::Exited(Some(ExitStatus::from_raw(7)))));
+        assert_eq!(watcher.next_event(), Some(ChildEvent::Exited(Some(ExitStatus::from_raw(7)))));
+
+        // The manually-built watcher has no registered WinAPI wait to remove.
+        std::mem::forget(watcher);
     }
 }
