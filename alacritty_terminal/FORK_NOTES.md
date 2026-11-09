@@ -41,6 +41,14 @@ rest, in the order they landed:
   `Event::TextAreaSizeRequest` as 14 t with a formatter for
   `CSI 6 ; cell_height ; cell_width t`, so a host that answers one answers both.
   Needs the `vte` fork at a rev that dispatches 16 (2026-10-24).
+- **Colour-scheme reports** (`CSI ? 996 n`, mode 2031): `Term::set_color_scheme`
+  takes the embedder's light or dark. `Handler::private_device_status(996)`
+  answers `CSI ? 997 ; 1 n` (dark) or `CSI ? 997 ; 2 n` (light), and nothing
+  before a scheme is set. `CSI ? 2031 h/l` turns reports on and off, kept in a
+  field rather than a `TermMode` flag so upstream's mode set is unchanged, and
+  while it is on a change of scheme is reported unasked. DECRQM `?2031` reads
+  it back, and RIS clears it. Needs the `vte` fork at a rev that dispatches
+  `CSI ? Ps n` (2026-11-09, zestful-terminal ZT-1171).
 
 ### `Shell::arg0` (2026-10-13)
 
@@ -207,7 +215,9 @@ fairness — to save a 5-line delta. Rejected.
 
 ## Tests
 
-Eleven added in `term::tests`. One, `cell_size_pixels_is_reported_beside_the_text_area`,
+Thirteen added in `term::tests`. Two cover colour-scheme reports: the 996 query
+answered only once a scheme is set, and change reports gated on mode 2031,
+DECRQM and RIS. One, `cell_size_pixels_is_reported_beside_the_text_area`,
 records what the 16 t and 14 t formatters write for one fixed `WindowSize`
 and pins the two reports. The ten APC tests cover the whole path `Processor::advance` →
 forked `vte` → `Handler::apc_dispatch` → `Term`'s queue: payload delivery and
