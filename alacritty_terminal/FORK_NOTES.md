@@ -49,6 +49,14 @@ rest, in the order they landed:
   while it is on a change of scheme is reported unasked. DECRQM `?2031` reads
   it back, and RIS clears it. Needs the `vte` fork at a rev that dispatches
   `CSI ? Ps n` (2026-11-09, zestful-terminal ZT-1171).
+- **SGR-Pixels mouse mode** (mode 1016): `CSI ? 1016 h/l` sets a field read
+  by `Term::sgr_pixel_mouse`, rather than a `TermMode` flag, for the reason
+  2031 is one. The embedder encodes mouse reports, as it already does for
+  1000 to 1006, and in pixels while this is on. DECRQM `?1016` answers set or
+  reset instead of "not recognised", which is the answer herdr probes for
+  before it turns pixel mouse on. RIS clears it. vte needs no change: the
+  mode arrives as `PrivateMode::Unknown(1016)` (2026-11-09, zestful-terminal
+  ZT-918 item 10).
 
 ### `Shell::arg0` (2026-10-13)
 
@@ -215,7 +223,8 @@ fairness — to save a 5-line delta. Rejected.
 
 ## Tests
 
-Thirteen added in `term::tests`. Two cover colour-scheme reports: the 996 query
+Fourteen added in `term::tests`. One covers mode 1016: kept, read back by
+DECRQM, independent of 1006, and cleared by RIS. Two cover colour-scheme reports: the 996 query
 answered only once a scheme is set, and change reports gated on mode 2031,
 DECRQM and RIS. One, `cell_size_pixels_is_reported_beside_the_text_area`,
 records what the 16 t and 14 t formatters write for one fixed `WindowSize`
