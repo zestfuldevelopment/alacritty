@@ -463,6 +463,13 @@ pub struct Term<T> {
     /// [`TermMode`] flag, so upstream's mode set is unchanged.
     color_scheme_reports: bool,
 
+    /// Whether the program asked for mouse reports in pixels, with
+    /// `CSI ? 1016 h` (**zestful addition**). The embedder encodes the
+    /// reports; this only remembers the ask, and answers DECRQM for it. A
+    /// field rather than a [`TermMode`] flag, for the reason
+    /// [`Self::color_scheme_reports`] is one.
+    sgr_pixel_mouse: bool,
+
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
 
@@ -648,6 +655,7 @@ impl<T> Term<T> {
             graphics_events: Vec::new(),
             color_scheme: None,
             color_scheme_reports: false,
+            sgr_pixel_mouse: false,
             unhandled_oscs: Vec::new(),
             is_focused: Default::default(),
             selection: Default::default(),
@@ -1291,6 +1299,16 @@ impl<T> Term<T> {
     #[inline]
     pub fn has_graphics_events(&self) -> bool {
         !self.graphics_events.is_empty()
+    }
+
+    /// Whether the program asked for SGR mouse reports in pixels, with
+    /// `CSI ? 1016 h` (**zestful addition**).
+    ///
+    /// Like the other mouse modes, this is the embedder's to act on: the
+    /// terminal never writes a mouse report itself.
+    #[inline]
+    pub fn sgr_pixel_mouse(&self) -> bool {
+        self.sgr_pixel_mouse
     }
 
     /// Tell the terminal whether the embedder's colour scheme is light or
@@ -2225,6 +2243,7 @@ impl<T: EventListener> Handler for Term<T> {
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
         self.color_scheme_reports = false;
+        self.sgr_pixel_mouse = false;
 
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;
@@ -2315,6 +2334,10 @@ impl<T: EventListener> Handler for Term<T> {
                 self.color_scheme_reports = true;
                 return;
             },
+            PrivateMode::Unknown(SGR_PIXEL_MOUSE) => {
+                self.sgr_pixel_mouse = true;
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in set_private_mode");
                 return;
@@ -2380,6 +2403,10 @@ impl<T: EventListener> Handler for Term<T> {
             PrivateMode::Named(mode) => mode,
             PrivateMode::Unknown(COLOR_SCHEME_REPORTS) => {
                 self.color_scheme_reports = false;
+                return;
+            },
+            PrivateMode::Unknown(SGR_PIXEL_MOUSE) => {
+                self.sgr_pixel_mouse = false;
                 return;
             },
             PrivateMode::Unknown(mode) => {
@@ -2470,6 +2497,7 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
             PrivateMode::Unknown(COLOR_SCHEME_REPORTS) => self.color_scheme_reports.into(),
+            PrivateMode::Unknown(SGR_PIXEL_MOUSE) => self.sgr_pixel_mouse.into(),
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
 
@@ -2685,6 +2713,11 @@ impl<T: EventListener> Handler for Term<T> {
 /// (**zestful addition**). vte has no name for it, so it arrives as
 /// `PrivateMode::Unknown(2031)`.
 const COLOR_SCHEME_REPORTS: u16 = 2031;
+
+/// The DEC private mode that asks for SGR mouse reports in pixels rather than
+/// cells, xterm's SGR-Pixels (**zestful addition**). vte has no name for it,
+/// so it arrives as `PrivateMode::Unknown(1016)`.
+const SGR_PIXEL_MOUSE: u16 = 1016;
 
 /// Whether the embedder draws light or dark (**zestful addition**).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3013,6 +3046,29 @@ mod tests {
         drive(&mut term, b"\x1bc");
         term.set_color_scheme(ColorScheme::Light);
         assert_eq!(*wrote.borrow(), vec!["\x1b[?2031;2$y", "\x1b[?2031;1$y", "\x1b[?997;2n",]);
+    }
+
+    /// Mode 1016 is remembered for the embedder, read back by DECRQM as set or
+    /// reset (never "not recognised", which is what tells a program like herdr
+    /// the terminal has it), and cleared by RIS (zestful addition).
+    #[test]
+    fn mode_1016_is_kept_reported_and_cleared() {
+        let wrote = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, PtyRecorder(wrote.clone()));
+        assert!(!term.sgr_pixel_mouse());
+        drive(&mut term, b"\x1b[?1016$p");
+        drive(&mut term, b"\x1b[?1006;1016h");
+        assert!(term.sgr_pixel_mouse());
+        assert!(term.mode().contains(TermMode::SGR_MOUSE), "1006 beside it is untouched");
+        drive(&mut term, b"\x1b[?1016$p");
+        drive(&mut term, b"\x1b[?1016l");
+        assert!(!term.sgr_pixel_mouse());
+        assert!(term.mode().contains(TermMode::SGR_MOUSE), "and stays when 1016 goes");
+        drive(&mut term, b"\x1b[?1016h");
+        drive(&mut term, b"\x1bc");
+        assert!(!term.sgr_pixel_mouse(), "RIS clears it");
+        assert_eq!(*wrote.borrow(), vec!["\x1b[?1016;2$y", "\x1b[?1016;1$y"]);
     }
 
     /// CSI 16 t is answered with the cell, CSI 14 t with the text area, and the
