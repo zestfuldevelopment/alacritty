@@ -2119,7 +2119,7 @@ dependencies = [
 [[package]]
 name = "vte"
 version = "0.15.0"
-source = "git+https://github.com/zestfuldevelopment/vte?rev=05b572a45055d66a9081149baa4bf25b5b07007e#05b572a45055d66a9081149baa4bf25b5b07007e"
+source = "git+https://github.com/zestfuldevelopment/vte?rev=ff483319d47579197c3ced2e804d19ae054b1e3c#ff483319d47579197c3ced2e804d19ae054b1e3c"
 dependencies = [
  "arrayvec",
  "bitflags 2.9.4",
