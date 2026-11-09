@@ -451,6 +451,18 @@ pub struct Term<T> {
     /// graphics consumer must skip into the queue it drains every frame.
     unhandled_oscs: Vec<UnhandledOsc>,
 
+    /// The embedder's colour scheme, light or dark, if it has said.
+    ///
+    /// **zestful addition.** Answers `CSI ? 996 n`. Set by
+    /// [`Term::set_color_scheme`], which also reports a change while
+    /// [`Self::color_scheme_reports`] is on.
+    color_scheme: Option<ColorScheme>,
+
+    /// Whether the program asked to be told when the colour scheme changes,
+    /// with `CSI ? 2031 h` (**zestful addition**). A field rather than a
+    /// [`TermMode`] flag, so upstream's mode set is unchanged.
+    color_scheme_reports: bool,
+
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
 
@@ -634,6 +646,8 @@ impl<T> Term<T> {
             colors: color::Colors::default(),
             title_stack: Default::default(),
             graphics_events: Vec::new(),
+            color_scheme: None,
+            color_scheme_reports: false,
             unhandled_oscs: Vec::new(),
             is_focused: Default::default(),
             selection: Default::default(),
@@ -1277,6 +1291,40 @@ impl<T> Term<T> {
     #[inline]
     pub fn has_graphics_events(&self) -> bool {
         !self.graphics_events.is_empty()
+    }
+
+    /// Tell the terminal whether the embedder's colour scheme is light or
+    /// dark (**zestful addition**).
+    ///
+    /// Answers `CSI ? 996 n` from then on. A change, while the program has
+    /// `CSI ? 2031 h` on, is reported to it unasked, which is how a TUI learns
+    /// to re-query its palette after a light/dark switch. Setting the scheme
+    /// it already has reports nothing.
+    pub fn set_color_scheme(&mut self, scheme: ColorScheme)
+    where
+        T: EventListener,
+    {
+        if self.color_scheme == Some(scheme) {
+            return;
+        }
+        self.color_scheme = Some(scheme);
+        if self.color_scheme_reports {
+            self.report_color_scheme();
+        }
+    }
+
+    fn report_color_scheme(&mut self)
+    where
+        T: EventListener,
+    {
+        let Some(scheme) = self.color_scheme else {
+            return;
+        };
+        let code = match scheme {
+            ColorScheme::Dark => 1,
+            ColorScheme::Light => 2,
+        };
+        self.event_proxy.send_event(Event::PtyWrite(format!("\x1b[?997;{code}n")));
     }
 
     /// Take every unhandled OSC since the last call, in stream order.
@@ -2176,6 +2224,7 @@ impl<T: EventListener> Handler for Term<T> {
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
+        self.color_scheme_reports = false;
 
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;
@@ -2262,6 +2311,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn set_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(COLOR_SCHEME_REPORTS) => {
+                self.color_scheme_reports = true;
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in set_private_mode");
                 return;
@@ -2325,6 +2378,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(COLOR_SCHEME_REPORTS) => {
+                self.color_scheme_reports = false;
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in unset_private_mode");
                 return;
@@ -2412,6 +2469,7 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
+            PrivateMode::Unknown(COLOR_SCHEME_REPORTS) => self.color_scheme_reports.into(),
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
 
@@ -2609,6 +2667,30 @@ impl<T: EventListener> Handler for Term<T> {
             format!("\x1b[6;{};{}t", window_size.cell_height, window_size.cell_width)
         })));
     }
+
+    /// `CSI ? 996 n`, the colour-scheme query (**zestful addition**). Answered
+    /// `CSI ? 997 ; 1 n` for dark and `CSI ? 997 ; 2 n` for light, and not at
+    /// all before the embedder has said which: a guess would be a wrong answer
+    /// half the time.
+    #[inline]
+    fn private_device_status(&mut self, arg: usize) {
+        match arg {
+            996 => self.report_color_scheme(),
+            _ => debug!("unknown private device status query: {arg}"),
+        }
+    }
+}
+
+/// The DEC private mode that turns colour-scheme change reports on
+/// (**zestful addition**). vte has no name for it, so it arrives as
+/// `PrivateMode::Unknown(2031)`.
+const COLOR_SCHEME_REPORTS: u16 = 2031;
+
+/// Whether the embedder draws light or dark (**zestful addition**).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorScheme {
+    Dark,
+    Light,
 }
 
 /// The state of the [`Mode`] and [`PrivateMode`].
@@ -2873,6 +2955,64 @@ mod tests {
                 self.0.borrow_mut().push(format(size));
             }
         }
+    }
+
+    /// Records what the terminal writes back to the program.
+    struct PtyRecorder(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+    impl EventListener for PtyRecorder {
+        fn send_event(&self, event: Event) {
+            if let Event::PtyWrite(text) = event {
+                self.0.borrow_mut().push(text);
+            }
+        }
+    }
+
+    fn drive(term: &mut Term<PtyRecorder>, bytes: &[u8]) {
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(term, bytes);
+    }
+
+    /// `CSI ? 996 n` is answered from the scheme the embedder set, and not
+    /// before it has set one (zestful addition).
+    #[test]
+    fn the_colour_scheme_query_is_answered_once_the_scheme_is_known() {
+        let wrote = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, PtyRecorder(wrote.clone()));
+
+        drive(&mut term, b"\x1b[?996n");
+        assert!(wrote.borrow().is_empty(), "no scheme yet, so no guess");
+
+        term.set_color_scheme(ColorScheme::Dark);
+        drive(&mut term, b"\x1b[?996n");
+        term.set_color_scheme(ColorScheme::Light);
+        drive(&mut term, b"\x1b[?996n");
+        assert_eq!(*wrote.borrow(), vec!["\x1b[?997;1n", "\x1b[?997;2n"]);
+    }
+
+    /// With `CSI ? 2031 h` on, a change of scheme is reported unasked, the
+    /// same scheme again is not, and `CSI ? 2031 l` or a reset stops it.
+    /// DECRQM reads the mode back (zestful addition).
+    #[test]
+    fn a_scheme_change_is_reported_only_while_mode_2031_is_on() {
+        let wrote = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, PtyRecorder(wrote.clone()));
+        term.set_color_scheme(ColorScheme::Dark);
+        assert!(wrote.borrow().is_empty(), "the mode is off");
+
+        drive(&mut term, b"\x1b[?2031$p");
+        drive(&mut term, b"\x1b[?2031h");
+        drive(&mut term, b"\x1b[?2031$p");
+        term.set_color_scheme(ColorScheme::Light);
+        term.set_color_scheme(ColorScheme::Light);
+        drive(&mut term, b"\x1b[?2031l");
+        term.set_color_scheme(ColorScheme::Dark);
+        drive(&mut term, b"\x1b[?2031h");
+        drive(&mut term, b"\x1bc");
+        term.set_color_scheme(ColorScheme::Light);
+        assert_eq!(*wrote.borrow(), vec!["\x1b[?2031;2$y", "\x1b[?2031;1$y", "\x1b[?997;2n",]);
     }
 
     /// CSI 16 t is answered with the cell, CSI 14 t with the text area, and the
